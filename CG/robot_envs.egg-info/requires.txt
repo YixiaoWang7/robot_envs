@@ -1,0 +1,14 @@
+gymnasium
+numpy
+Pillow
+mimicgen
+robosuite
+imageio>=2.37.3
+imageio-ffmpeg>=0.6.0
+
+[flow]
+torch
+torchvision
+torchaudio
+pydantic>=2.12.5
+transformers>=5.3.0

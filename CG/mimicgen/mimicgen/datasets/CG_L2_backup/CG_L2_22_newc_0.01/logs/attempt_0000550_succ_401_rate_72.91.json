@@ -1,0 +1,10 @@
+{
+    "generation_path": "/home/jix22/CG/mimicgen/mimicgen/datasets/CG_L2_500/CG_L2_22",
+    "success_rate": 72.9090909090909,
+    "failure_rate": 27.09090909090909,
+    "num_success": 401,
+    "num_failures": 149,
+    "num_attempts": 550,
+    "num_problematic": 0,
+    "time spent (hrs)": "0.52"
+}

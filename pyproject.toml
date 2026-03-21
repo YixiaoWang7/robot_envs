@@ -1,0 +1,46 @@
+[project]
+name = "robot-envs"
+version = "0.1.0"
+description = "Standalone robot envs (CG-L2 wrappers + vendored robosuite)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium",
+  "numpy",
+  "Pillow",
+  "mimicgen",
+  "robosuite",
+  "imageio>=2.37.3",
+  "imageio-ffmpeg>=0.6.0",
+]
+
+[project.optional-dependencies]
+flow = [
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "pydantic>=2.12.5",
+  "transformers>=5.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["CG_L2_image_wrapper", "CG_L2_state_wrapper"]
+
+[tool.setuptools.package-dir]
+"" = "CG"
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+robosuite = { path = "CG/robosuite", editable = true }
+mimicgen = { path = "CG/mimicgen", editable = true }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]

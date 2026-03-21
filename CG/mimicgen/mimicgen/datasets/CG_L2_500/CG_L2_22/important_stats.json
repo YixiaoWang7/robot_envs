@@ -1,0 +1,14 @@
+{
+    "generation_path": "/home/jix22/CG/mimicgen/mimicgen/datasets/CG_L2_500/CG_L2_22",
+    "success_rate": 75.3012048192771,
+    "failure_rate": 24.698795180722893,
+    "num_success": 500,
+    "num_failures": 164,
+    "num_attempts": 664,
+    "num_problematic": 0,
+    "ep_length_mean": 243.528,
+    "ep_length_std": 22.636722730996198,
+    "ep_length_max": 336,
+    "ep_length_3std": 312,
+    "time spent (hrs)": "0.63"
+}
