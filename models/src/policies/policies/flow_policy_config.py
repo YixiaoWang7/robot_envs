@@ -52,3 +52,16 @@ class AttentionModelConfig(BaseModel):
     env_entity_dim: int = 7
     env_token_embed_dim: int = 256
 
+    # How env_state is condensed into a conditioning vector.
+    #
+    # "attention_pool"  — project all N entity slots into embed_dim tokens, add
+    #                     per-slot learnable embeddings, then pool with task-conditioned
+    #                     cross-attention queries (obj_query + cont_query).
+    #
+    # "direct_select"   — use task_indices to directly pick the target-object slot
+    #                     (index = object_id) and target-container slot
+    #                     (index = num_objects + container_id), project each raw
+    #                     7-D pose through a dedicated head to pooled_dim, then
+    #                     concatenate.  Simpler / expert-policy baseline; no attention.
+    env_state_mode: Literal["attention_pool", "direct_select"] = "attention_pool"
+

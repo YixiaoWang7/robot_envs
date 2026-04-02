@@ -53,4 +53,11 @@ python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolic
 /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_only_ac20_k8/checkpoints/ckpt_step_0050000.pt
 
 
-python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_only_ac20_k8/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 10 --out-dir results/state
+python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_only_ac20_k8/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 24 --out-dir results/state_attn
+
+
+python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_direct_select_ac20_k8/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 24 --out-dir results/state_direct
+
+
+
+python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/state_all_10kstep/checkpoints/ckpt_step_0100000.pt   --n-episodes 100 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 24 --out-dir results/state_direct

@@ -353,7 +353,15 @@ class StateBasedCGWrapper:
         kwargs.pop("seed", None)
         self.obs = []
         
-        task = ["place the cross into the bin", "place the cube into the cup", "place the cylinder into the plate"]
+        task = ["place the cross into the bin",
+                "place the cross into the cup",
+                "place the cross into the plate",
+                "place the cube into the bin",
+                "place the cube into the cup",
+                "place the cube into the plate",
+                "place the cylinder into the plate",
+                "place the cylinder into the bin",
+                "place the cylinder into the cup"]
         # task = ["place the cylinder into the plate"]
         for i, env in enumerate(self.envs):
             env.strategy = "fixed"
