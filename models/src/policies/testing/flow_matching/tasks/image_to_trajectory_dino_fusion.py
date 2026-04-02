@@ -1,0 +1,434 @@
+#!/usr/bin/env python
+
+"""Image-conditioned trajectory task using DINOv2 + fusion pooling + policy head.
+
+Validates:
+- `policies.modules.vision.DinoImageEncoder` (patch tokens)
+- `policies.modules.fusion.CrossAttentionPooling` (token-to-vector fusion)
+- `policies.modules.policy_head.FiLMConvPolicyHead` (global conditioning)
+- End-to-end flow matching on an image-conditioned sequence task
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from policies.algorithms.flow_matching import FlowMatchingAlgorithm
+from policies.modules.fusion.attention_projector import CrossAttentionPooling
+from policies.modules.policy_head.unet import FiLMConvPolicyHead
+from policies.modules.task.learnable_query import LearnableQueryTokens
+from policies.modules.vision.dino import DinoImageEncoder
+
+
+def _draw_circle(img: np.ndarray) -> None:
+    H, W = img.shape
+    cy, cx = H // 2, W // 2
+    r = H // 3
+    yy, xx = np.ogrid[:H, :W]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    img[np.abs(dist - r) < 1.5] = 1.0
+
+
+def _draw_arrow(img: np.ndarray, direction: str) -> None:
+    """Draw a simple arrow pointing in one of {'right','left','up','down'}."""
+    H, W = img.shape
+    cy, cx = H // 2, W // 2
+    L = H // 3
+    d = str(direction).lower()
+
+    if d == "right":
+        img[cy - 1 : cy + 2, cx - L : cx + L] = 1.0
+        img[cy - 4 : cy + 5, cx + L - 3 : cx + L] = 1.0
+        return
+    if d == "left":
+        img[cy - 1 : cy + 2, cx - L : cx + L] = 1.0
+        img[cy - 4 : cy + 5, cx - L : cx - L + 3] = 1.0
+        return
+    if d == "up":
+        img[cy - L : cy + L, cx - 1 : cx + 2] = 1.0
+        img[cy - L : cy - L + 3, cx - 4 : cx + 5] = 1.0
+        return
+    if d == "down":
+        img[cy - L : cy + L, cx - 1 : cx + 2] = 1.0
+        img[cy + L - 3 : cy + L, cx - 4 : cx + 5] = 1.0
+        return
+    raise ValueError(f"Unknown arrow direction={direction!r}")
+
+
+def _draw_w(img: np.ndarray, *, flip_y: bool = False) -> None:
+    """Draw a W-like polyline."""
+    H, W = img.shape
+    pts = np.array(
+        [
+            [-0.7, 0.6],
+            [-0.35, -0.6],
+            [0.0, 0.6],
+            [0.35, -0.6],
+            [0.7, 0.6],
+        ],
+        dtype=np.float32,
+    )
+    if flip_y:
+        pts[:, 1] *= -1.0
+    # Convert [-1,1] coords to image coords.
+    xs = (pts[:, 0] + 1.0) * (W / 2.0)
+    ys = (pts[:, 1] + 1.0) * (H / 2.0)
+    for i in range(len(xs) - 1):
+        x0, y0, x1, y1 = xs[i], ys[i], xs[i + 1], ys[i + 1]
+        t = np.linspace(0, 1, 80)
+        x = (1 - t) * x0 + t * x1
+        y = (1 - t) * y0 + t * y1
+        xi = np.clip(np.round(x).astype(int), 0, W - 1)
+        yi = np.clip(np.round(y).astype(int), 0, H - 1)
+        img[yi, xi] = 1.0
+
+
+def _traj_circle(T: int, start_angle: float) -> np.ndarray:
+    angles = np.linspace(start_angle, start_angle + 2 * np.pi, T, endpoint=False)
+    x = 0.7 * np.cos(angles)
+    y = 0.7 * np.sin(angles)
+    return np.stack([x, y], axis=-1)
+
+
+def _traj_arrow(T: int, direction: str) -> np.ndarray:
+    """Trajectory consistent with `_draw_arrow`."""
+    d = str(direction).lower()
+    t = np.linspace(-0.7, 0.7, T, dtype=np.float32)
+    if d == "right":
+        return np.stack([t, np.zeros_like(t)], axis=-1)
+    if d == "left":
+        return np.stack([t[::-1].copy(), np.zeros_like(t)], axis=-1)
+    if d == "up":
+        return np.stack([np.zeros_like(t), t[::-1].copy()], axis=-1)
+    if d == "down":
+        return np.stack([np.zeros_like(t), t], axis=-1)
+    raise ValueError(f"Unknown arrow direction={direction!r}")
+
+
+def _traj_w(T: int, *, flip_y: bool = False) -> np.ndarray:
+    """A smooth W-like trajectory (piecewise-linear polyline resampled to length T)."""
+    pts = np.array(
+        [
+            [-0.7, 0.6],
+            [-0.35, -0.6],
+            [0.0, 0.6],
+            [0.35, -0.6],
+            [0.7, 0.6],
+        ],
+        dtype=np.float32,
+    )
+    if flip_y:
+        pts[:, 1] *= -1.0
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.sqrt((seg**2).sum(axis=1))
+    total = float(seg_len.sum())
+    # Sample along arclength.
+    s = np.linspace(0.0, total, T, dtype=np.float32)
+    out = np.zeros((T, 2), dtype=np.float32)
+    acc = 0.0
+    j = 0
+    for i in range(T):
+        si = float(s[i])
+        while j < len(seg_len) - 1 and si > acc + float(seg_len[j]):
+            acc += float(seg_len[j])
+            j += 1
+        t = 0.0 if seg_len[j] < 1e-6 else (si - acc) / float(seg_len[j])
+        out[i] = pts[j] + t * seg[j]
+    return out
+
+
+@dataclass(frozen=True)
+class DinoFusionImageToTrajectoryTask:
+    """Toy image->trajectory task.
+
+    Each sample contains:
+    - an image (binary sketch of a shape)
+    - a start point (first point of the trajectory)
+    - a 2D trajectory (T,2) to be generated by the model
+    """
+
+    name: str = "img_traj_dino_fusion"
+    horizon: int = 32
+    image_size: int = 32
+    num_query_tokens: int = 4
+    pooled_dim: int = 64
+
+    @property
+    def action_dim(self) -> int:
+        return 2
+
+    @property
+    def cond_dim(self) -> int:
+        # global_cond = [start_xy (2), pooled_image (num_query_tokens * pooled_dim)]
+        return 2 + self.num_query_tokens * self.pooled_dim
+
+    def _sample_numpy(
+        self,
+        n: int,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        images = np.zeros((n, self.image_size, self.image_size), dtype=np.float32)
+        trajs = np.zeros((n, self.horizon, 2), dtype=np.float32)
+        starts = np.zeros((n, 2), dtype=np.float32)
+        circle_start_angle = np.zeros((n,), dtype=np.float32)
+        arrow_dir_id = np.full((n,), -1, dtype=np.int64)
+
+        # shape_id: 0=circle, 1=arrow, 2=W
+        shape_id = rng.integers(0, 3, size=(n,))
+        for i in range(n):
+            img = images[i]
+            if shape_id[i] == 0:
+                _draw_circle(img)
+                start_angle = float(rng.choice(np.linspace(0, 2 * np.pi, 8, endpoint=False)))
+                circle_start_angle[i] = np.float32(start_angle)
+                traj = _traj_circle(self.horizon, start_angle)
+            elif shape_id[i] == 1:
+                arrow_dirs = ["right", "left", "up", "down"]
+                dir_idx = int(rng.integers(0, len(arrow_dirs)))
+                arrow_dir_id[i] = dir_idx
+                d = arrow_dirs[dir_idx]
+                _draw_arrow(img, d)
+                traj = _traj_arrow(self.horizon, d)
+            else:
+                flip_y = bool(rng.integers(0, 2))
+                _draw_w(img, flip_y=flip_y)
+                traj = _traj_w(self.horizon, flip_y=flip_y)
+
+            trajs[i] = traj
+            starts[i] = traj[0]
+
+        # Slight blur/noise to avoid degenerate pixels
+        images = images + 0.02 * rng.standard_normal(images.shape).astype(np.float32)
+        images = np.clip(images, 0.0, 1.0)
+        return images, trajs, starts, shape_id.astype(np.int64), circle_start_angle, arrow_dir_id
+
+    def sample_batch(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        rng = np.random.default_rng()
+        images_np, trajs_np, starts_np, _, _, _ = self._sample_numpy(batch_size, rng)
+
+        # (B,H,W) -> (B,3,224,224)
+        images = torch.from_numpy(images_np).to(device=device, dtype=dtype)
+        images = images[:, None, :, :].repeat(1, 3, 1, 1)
+        images = torch.nn.functional.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
+
+        traj = torch.from_numpy(trajs_np).to(device=device, dtype=dtype)  # (B,T,2)
+        start = torch.from_numpy(starts_np).to(device=device, dtype=dtype)  # (B,2)
+
+        # We return start as global_cond; the vector field module will concatenate image features.
+        global_cond = start  # (B,2)
+        object.__setattr__(self, "_last_images", images)  # type: ignore[misc]
+        return traj, global_cond
+
+    def on_batch(self, *, vector_field_net: nn.Module, x_1: Tensor, global_cond: Tensor) -> None:
+        """Set images on the vector field net for this batch."""
+        images: Tensor | None = getattr(self, "_last_images", None)  # type: ignore[attr-defined]
+        if images is None:
+            raise ValueError("Internal error: _last_images not set.")
+        if not hasattr(vector_field_net, "set_images"):
+            raise ValueError("vector_field_net does not support set_images(images).")
+        vector_field_net.set_images(images)  # type: ignore[attr-defined]
+
+    @torch.no_grad()
+    def visualize(
+        self,
+        *,
+        out_dir: Path,
+        step: int,
+        algo: FlowMatchingAlgorithm,
+        vector_field_net: nn.Module,
+        device: torch.device,
+        dtype: torch.dtype,
+        n_samples: int,
+        loss_history: list[float],
+    ) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n = min(6, n_samples)
+
+        # Build a fixed, diverse set of conditions for visualization (no repeats):
+        # - 2x circles (different start angles)
+        # - 2x W variants (flip_y False/True)
+        # - 2x arrow directions (right/up)
+        rng = np.random.default_rng(0)
+        images_np = np.zeros((n, self.image_size, self.image_size), dtype=np.float32)
+        trajs_np = np.zeros((n, self.horizon, 2), dtype=np.float32)
+        starts_np = np.zeros((n, 2), dtype=np.float32)
+        shape_id = np.zeros((n,), dtype=np.int64)
+        circle_angle = np.zeros((n,), dtype=np.float32)
+        arrow_dir_id = np.full((n,), -1, dtype=np.int64)
+
+        def make_circle(i: int, angle_deg: float) -> None:
+            img = images_np[i]
+            _draw_circle(img)
+            a = float(angle_deg) * np.pi / 180.0
+            circle_angle[i] = np.float32(a)
+            traj = _traj_circle(self.horizon, a)
+            trajs_np[i] = traj
+            starts_np[i] = traj[0]
+            shape_id[i] = 0
+
+        def make_w(i: int, flip_y: bool) -> None:
+            img = images_np[i]
+            _draw_w(img, flip_y=flip_y)
+            traj = _traj_w(self.horizon, flip_y=flip_y)
+            trajs_np[i] = traj
+            starts_np[i] = traj[0]
+            shape_id[i] = 2
+
+        def make_arrow(i: int, direction: str) -> None:
+            img = images_np[i]
+            _draw_arrow(img, direction)
+            traj = _traj_arrow(self.horizon, direction)
+            trajs_np[i] = traj
+            starts_np[i] = traj[0]
+            shape_id[i] = 1
+            arrow_dir_id[i] = {"right": 0, "left": 1, "up": 2, "down": 3}[direction]
+
+        make_w(0, flip_y=False)
+        make_w(1, flip_y=True)
+        make_arrow(2, "right")
+        make_arrow(3, "up")
+        make_circle(4, 0.0)
+        make_circle(5, 90.0)
+
+        images_np = images_np + 0.02 * rng.standard_normal(images_np.shape).astype(np.float32)
+        images_np = np.clip(images_np, 0.0, 1.0)
+
+        images = torch.from_numpy(images_np).to(device=device, dtype=dtype)
+        images = images[:, None, :, :].repeat(1, 3, 1, 1)
+        images = torch.nn.functional.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
+        x_real = torch.from_numpy(trajs_np).to(device=device, dtype=dtype)
+        start = torch.from_numpy(starts_np).to(device=device, dtype=dtype)
+
+        # Set images for the vector field net to consume.
+        vector_field_net.set_images(images)
+
+        # For each condition (image + start), generate multiple trajectories from different noise seeds.
+        n_gen_per = 24
+        x0 = torch.randn(n * n_gen_per, self.horizon, 2, device=device, dtype=dtype)
+        start_rep = start.repeat_interleave(n_gen_per, dim=0)  # (n*n_gen_per,2)
+        images_rep = images.repeat_interleave(n_gen_per, dim=0)  # (n*n_gen_per,3,224,224)
+        vector_field_net.set_images(images_rep)
+        x_gen_all = algo.generate_samples(vector_field_net=vector_field_net, initial_noise=x0, global_cond=start_rep)
+        x_gen_all = x_gen_all.reshape(n, n_gen_per, self.horizon, 2)
+
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        axes = axes.reshape(-1)
+        for i in range(n):
+            ax = axes[i]
+            ax.imshow(images_np[i], cmap="gray", vmin=0, vmax=1, alpha=0.6)
+            # Convert [-1,1] coords to image coords.
+            def to_img(p):
+                return (p + 1) * (self.image_size / 2)
+
+            r = x_real[i].detach().cpu().numpy()
+            # Plot the real trajectory once (thick).
+            ax.plot(to_img(r[:, 0]), to_img(r[:, 1]), color="tab:blue", linewidth=2.5, alpha=0.9)
+            # Plot many generated trajectories (thin), showing diversity/consistency.
+            for j in range(n_gen_per):
+                g = x_gen_all[i, j].detach().cpu().numpy()
+                ax.plot(to_img(g[:, 0]), to_img(g[:, 1]), color="tab:orange", linewidth=1.0, alpha=0.18)
+            ax.scatter([to_img(r[0, 0])], [to_img(r[0, 1])], c="red", s=180, marker="*", edgecolors="white", linewidth=1.5)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if int(shape_id[i]) == 0:
+                shape_name = "circle"
+            elif int(shape_id[i]) == 1:
+                shape_name = {0: "arrow_right", 1: "arrow_left", 2: "arrow_up", 3: "arrow_down"}[int(arrow_dir_id[i])]
+            else:
+                shape_name = "W" if i == 0 else "W_flipped"
+            extra = ""
+            if int(shape_id[i]) == 0:
+                extra = f", start_angle={float(circle_angle[i]) * 180.0 / np.pi:.0f}°"
+            ax.set_title(f"cond {i}: {shape_name}{extra}\n{n_gen_per} gens")
+
+        fig.suptitle(f"{self.name}: real(blue) + many gen(orange) @ step {step}", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"viz_step_{step:06d}.png", dpi=160)
+        plt.close(fig)
+
+
+class DinoFusionVectorField(nn.Module):
+    """Vector field: (x_t, t, global_cond=start_xy) -> velocity, using image encoder + fusion."""
+
+    def __init__(
+        self,
+        *,
+        horizon: int,
+        num_query_tokens: int = 4,
+        pooled_dim: int = 64,
+        dino_model_size: str = "small",
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+
+        self.encoder = DinoImageEncoder(
+            model_size=dino_model_size,
+            input_shape=(3, 224, 224),
+            crop_shape=None,
+            crop_is_random=False,
+            freeze_backbone=freeze_backbone,
+            default_output="patch",
+        )
+
+        d = int(self.encoder.model_dim)
+        self.fusion = CrossAttentionPooling(
+            input_shape=(d, 1, 1),
+            embed_dim=d,
+            out_dim=pooled_dim,
+            num_layers=2,
+            num_heads=8,
+            ff_dim=512,
+            dropout=0.1,
+        )
+
+        self.query_tokens = LearnableQueryTokens(num_query_tokens=num_query_tokens, dim=d)
+
+        global_cond_dim = 2 + num_query_tokens * pooled_dim
+        self.head = FiLMConvPolicyHead(
+            action_dim=2,
+            horizon=self.horizon,
+            global_cond_dim=global_cond_dim,
+            n_obs_steps=1,
+            time_embed_dim=128,
+            down_dims=(128, 256, 512),
+            kernel_size=5,
+            n_groups=8,
+            use_film_scale_modulation=True,
+        )
+
+        self._images: Tensor | None = None
+
+    def set_images(self, images: Tensor) -> None:
+        """Set the batch images (B,3,224,224) used for subsequent forward calls."""
+        self._images = images
+
+    def forward(self, x_t: Tensor, t: Tensor, *, global_cond: Tensor) -> Tensor:
+        if self._images is None:
+            raise ValueError("Images not set. Call `vector_field_net.set_images(images)` before training/sampling.")
+        images = self._images
+        if images.shape[0] != x_t.shape[0]:
+            raise ValueError(f"Batch mismatch: images B={images.shape[0]} vs x_t B={x_t.shape[0]}")
+
+        patch_tokens = self.encoder(images, output="patch")  # (B, L, D)
+        q = self.query_tokens(
+            batch_size=patch_tokens.shape[0],
+            device=patch_tokens.device,
+            dtype=patch_tokens.dtype,
+        )  # (B, Tq, D)
+        pooled = self.fusion(patch_tokens, query_tokens=q)  # (B, Tq, pooled_dim)
+        img_feat = pooled.flatten(start_dim=1)  # (B, Tq*pooled_dim)
+
+        start = global_cond
+        if start.ndim != 2 or start.shape[1] != 2:
+            raise ValueError(f"global_cond must be start_xy with shape (B,2), got {tuple(start.shape)}")
+        full_cond = torch.cat([start, img_feat], dim=-1)
+        return self.head(x_t, t, global_cond=full_cond)
+

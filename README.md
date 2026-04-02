@@ -47,4 +47,10 @@ from CG_L2_state_wrapper import StateBasedCGWrapper
 python tests/eval_policy.py --mode flow --checkpoint models/ckpt/ckpt_step_0050000.pt --steps 200 --device cuda:1 --out-dir artifacts
 
 
-python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:0   --max-videos 10 --out-dir artifacts
+python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_ac20_k8_amp/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 10 --out-dir artifacts/ac20_k8_amp
+
+
+/home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_only_ac20_k8/checkpoints/ckpt_step_0050000.pt
+
+
+python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/robot_flow_train_lr_cosine_state_only_ac20_k8/checkpoints/ckpt_step_0050000.pt   --n-episodes 50 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 10 --out-dir results/state

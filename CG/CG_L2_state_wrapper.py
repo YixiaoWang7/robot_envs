@@ -65,6 +65,7 @@ class StateBasedCGWrapper:
         self.obs = [None] * num_envs
         self.step_counter = [0] * num_envs
         self.use_relative_coordinates = use_relative_coordinates
+
         self.gripper_types = gripper_types
         # Store previous robot states for comparison
         self.prev_gripper_qpos = [None] * num_envs
@@ -352,86 +353,23 @@ class StateBasedCGWrapper:
         kwargs.pop("seed", None)
         self.obs = []
         
-        if self.num_envs % 2 != 0:
-            raise ValueError("num_envs must be even")
-
-
-        # "L2":[[0,1],[1,0],[1,1],[1,2],[2,1]],
-        # "Sfull":[[0,0],[0,1],[1,1],[1,2],[2,2],[2,0]],
-        # "diagmid":[[0,0],[1,1],[2,2],[0,1]],
-        # "diagcorner":[[0,0],[1,1],[2,2],[0,2]],
-
-
-        if self.train_task == "S":
-            ood_list = [(0, 2), (1, 0), (2, 0), (2, 1)]
-        elif self.train_task == "L":
-            ood_list = [(1, 1), (1, 2), (2, 1), (2, 2)]
-        elif self.train_task == "only-00":
-            ood_list = [(0, 0)]
-        elif self.train_task == "diag":
-            ood_list = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
-        elif self.train_task == "L2":
-            ood_list = [(0, 1), (1, 0), (1, 1), (1, 2), (2, 1)]
-        elif self.train_task == "Sfull":
-            ood_list = [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (2, 0)]
-        elif self.train_task == "diagmid":
-            ood_list = [(0, 0), (1, 1), (2, 2), (0, 1)]
-        elif self.train_task == "diagcorner":
-            ood_list = [(0, 0), (1, 1), (2, 2), (0, 2)]
-        elif self.train_task == "all":
-            ood_list = []
-        else:
-            raise ValueError(f"Invalid train task: {self.train_task}")
-
-
-        if len(ood_list) > 0:
-            if self.num_envs % 2 != 0:
-                raise ValueError("num_envs must be even for ood and id separation.")
-            target_per_group = self.num_envs // 2
-            id_num = 0   # count of envs with y < -0.15
-            ood_num = 0  # count of envs with y > -0.12
-
-            for i, env in enumerate(self.envs):
-                while True:
-                    obs_i = env.reset(**kwargs)
-                    task_id = get_task_ood_label(env.task)
-                    
-                    if id_num >= target_per_group:
-                        if task_id in ood_list:
-                            ood_num += 1
-                            break
-                    elif ood_num >= target_per_group:
-                        if task_id not in ood_list:
-                            id_num += 1
-                            break
-                    else:
-                        if task_id in ood_list:
-                            ood_num += 1
-                            break
-                        else:
-                            id_num += 1
-                            break
-                        
-                self.obs.append(obs_i)
-                self.step_counter[i] = 0
-                # Initialize previous robot states
-                self.prev_gripper_qpos[i] = obs_i["robot0_gripper_qpos"].copy()
-                self.prev_eef_pos[i] = obs_i["robot0_eef_pos"].copy()
-                self.prev_eef_quat[i] = obs_i["robot0_eef_quat"].copy()
-                self.prev_joint_pos[i] = obs_i["robot0_joint_pos"].copy()
-                self.prev_joint_vel[i] = obs_i.get("robot0_joint_vel", np.zeros_like(obs_i["robot0_joint_pos"])).copy()            
-        else:
-            for i, env in enumerate(self.envs):
-                obs_i = env.reset(**kwargs)
-                
-                self.obs.append(obs_i)
-                self.step_counter[i] = 0
-                # Initialize previous robot states
-                self.prev_gripper_qpos[i] = obs_i["robot0_gripper_qpos"].copy()
-                self.prev_eef_pos[i] = obs_i["robot0_eef_pos"].copy()
-                self.prev_eef_quat[i] = obs_i["robot0_eef_quat"].copy()
-                self.prev_joint_pos[i] = obs_i["robot0_joint_pos"].copy()
-                self.prev_joint_vel[i] = obs_i.get("robot0_joint_vel", np.zeros_like(obs_i["robot0_joint_pos"])).copy()
+        task = ["place the cross into the bin", "place the cube into the cup", "place the cylinder into the plate"]
+        # task = ["place the cylinder into the plate"]
+        for i, env in enumerate(self.envs):
+            env.strategy = "fixed"
+            env.task = np.random.choice(task)
+            obs_i = env.reset(**kwargs)
+            
+            self.obs.append(obs_i)
+            self.step_counter[i] = 0
+            # Initialize previous robot states
+            self.prev_gripper_qpos[i] = obs_i["robot0_gripper_qpos"].copy()
+            self.prev_eef_pos[i] = obs_i["robot0_eef_pos"].copy()
+            self.prev_eef_quat[i] = obs_i["robot0_eef_quat"].copy()
+            self.prev_joint_pos[i] = obs_i["robot0_joint_pos"].copy()
+            self.prev_joint_vel[i] = obs_i.get("robot0_joint_vel", np.zeros_like(obs_i["robot0_joint_pos"])).copy()
+            
+            
 
         obs_dicts = [self._compute_observation(i) for i in range(self.num_envs)]
         batched_obs = {
@@ -592,8 +530,10 @@ class StateBasedCGWrapper:
             cup = transform_to_relative_coordinates(robot0_eef_pos, robot0_eef_quat, cup)
             plate = transform_to_relative_coordinates(robot0_eef_pos, robot0_eef_quat, plate)
 
-        state = np.concatenate([robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos, joint_pos])
-        environment_state = np.concatenate([cross, cube, cylinder, bin, cup, plate])
+        # Match the state-policy training config: 9D robot state and 45D env_state.
+        state = np.concatenate([robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos])
+        gripper_to_object_A_pos = np.asarray(self.obs[idx]["gripper_to_object_A_pos"], dtype=np.float32)
+        environment_state = np.concatenate([cross, cube, cylinder, bin, cup, plate, gripper_to_object_A_pos])
 
         return {
             "observation.state": state,

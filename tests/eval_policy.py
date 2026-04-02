@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Multi-episode policy evaluation on CG_L2 (ImageBasedCGWrapper).
+Multi-episode policy evaluation on CG_L2.
 
 Loads a RobotFlowPolicyWrapper checkpoint and runs MPC inference.
 
@@ -25,6 +25,7 @@ import numpy as np
 
 from robosuite.environments.manipulation.CG_L2 import CG_L2
 from CG_L2_image_wrapper import ImageBasedCGWrapper
+from CG_L2_state_wrapper import StateBasedCGWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ def _make_video_writer(path: Path, fps: int):
                 str(path),
                 fps=fps,
                 codec="libx264",
-                output_params=["-pix_fmt", "yuv420p", "-crf", "18"],
+                output_params=["-pix_fmt:v", "yuv420p", "-crf", "18"],
             )
         state["obj"].append_data(rgb_u8)
 
@@ -74,8 +75,8 @@ def _parse_task_indices(task: str | None) -> tuple[int, int]:
     obj = next((v for k, v in _OBJ_IDX.items() if k in tl), 0)
     cont = next((v for k, v in _CONT_IDX.items() if k in tl), 0)
     
-    obj = 0 
-    cont = 1
+    # obj = 0 
+    # cont = 1
     return obj, cont
 
 
@@ -100,11 +101,33 @@ def _preprocess_images(obs: dict, env_idx: int) -> np.ndarray:
         obs["observation.images.robot0_eye_in_hand"][env_idx],
     ]
     out = []
-    for im in cams:
+    cam_names = ["agentview", "robot0_eye_in_hand"]
+    debug_image = False
+    for cam_name, im in zip(cam_names, cams):
         im = im.astype(np.uint8)
-        im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
-        out.append(np.transpose(im, (2, 0, 1)))  # (3, H, W) uint8
+        im_bgr = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+        out.append(np.transpose(im_bgr, (2, 0, 1)))  # (3, H, W) uint8
+
+        # Save debug images for the first call (env_idx == 0) only.
+        if debug_image and env_idx == 0:
+            import os
+            from PIL import Image as _PIL
+            debug_dir = "debug_preprocess"
+            os.makedirs(debug_dir, exist_ok=True)
+            # Save raw RGB via PIL — correct colors if the wrapper outputs proper RGB.
+            _PIL.fromarray(im).save(f"{debug_dir}/{cam_name}_rgb.png")
+            # Save the BGR version via PIL — colors will look swapped (R↔B) if conversion is correct.
+            _PIL.fromarray(im_bgr).save(f"{debug_dir}/{cam_name}_bgr.png")
+    
+        
     return np.stack(out, axis=0)  # (n_cams, 3, H, W) uint8
+
+
+def _get_video_frame(env, obs: dict, env_idx: int) -> np.ndarray:
+    """Return an RGB uint8 frame for video logging."""
+    if "observation.images.agentview" in obs:
+        return obs["observation.images.agentview"][env_idx].astype(np.uint8)
+    return env.render()[env_idx].astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +135,24 @@ def _preprocess_images(obs: dict, env_idx: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def make_env(task: str, *, horizon: int) -> CG_L2:
+    strategy = "fixed"
+    env_task: str | None = task
+    if task == "all":
+        strategy = "all"
+        env_task = None
     return CG_L2(
         robots="Panda",
         gripper_types="PandaGripper",
-        strategy="fixed",
-        task=task,
+        strategy=strategy,
+        task=env_task,
         horizon=horizon,
         has_renderer=False,
         has_offscreen_renderer=True,
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=256,
         camera_widths=256,
-        render_camera="agentview",
+        render_camera=["agentview", "robot0_eye_in_hand"],
     )
-
 
 # ---------------------------------------------------------------------------
 # Policy loader
@@ -141,9 +168,9 @@ def build_policy(*, checkpoint: Path, device: str):
 
     repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root / "models" / "src"))
-    from policies.training.policy_wrapper import RobotFlowPolicyWrapper  # type: ignore
+    from policies.training.policy_loading import load_robot_flow_policy  # type: ignore
 
-    policy = RobotFlowPolicyWrapper.from_checkpoint(checkpoint, device=device)
+    policy = load_robot_flow_policy(checkpoint, device=device)
     policy.model.eval()
     return policy
 
@@ -153,7 +180,7 @@ def build_policy(*, checkpoint: Path, device: str):
 # ---------------------------------------------------------------------------
 
 def run_batch(
-    env: ImageBasedCGWrapper,
+    env,
     policy,
     *,
     horizon: int,
@@ -161,126 +188,113 @@ def run_batch(
     device: str,
     record_video: bool,
     fps: int,
-    video_paths: list[Path],       # one Path per env (pre-allocated, written if record_video)
-    episode_offset: int,           # for progress printing
+    video_paths: list[Path],
+    episode_offset: int,
 ) -> dict:
     """
     Run one full batched rollout (all envs until done or horizon).
-
-    Returns dict with per-env lists:
-      success   : bool
-      sum_reward: float
-      max_reward: float
-      length    : int
-      task      : str
-      frames    : list[np.ndarray]  (RGB uint8, only filled when record_video=True)
-      actions   : np.ndarray  (T, 7)
-      rewards   : np.ndarray  (T,)
+    Supports both image-conditioned and env_state-conditioned checkpoints.
     """
     num_envs = env.num_envs
     obs, _ = env.reset()
 
-    # Per-env bookkeeping
-    done        = [False] * num_envs
-    sum_rewards = [0.0]   * num_envs
-    max_rewards = [-1e9]  * num_envs
-    lengths     = [0]     * num_envs
-    tasks       = [getattr(env.envs[i], "task", "unknown") for i in range(num_envs)]
-    ep_frames   = [[] for _ in range(num_envs)]   # RGB frames per env
-    ep_actions  = [[] for _ in range(num_envs)]
-    ep_rewards  = [[] for _ in range(num_envs)]
-    ep_success  = [False] * num_envs
+    done = [False] * num_envs
+    sum_rewards = [0.0] * num_envs
+    max_rewards = [-1e9] * num_envs
+    lengths = [0] * num_envs
+    tasks = [getattr(env.envs[i], "task", "unknown") for i in range(num_envs)]
+    ep_frames = [[] for _ in range(num_envs)]
+    ep_actions = [[] for _ in range(num_envs)]
+    ep_rewards = [[] for _ in range(num_envs)]
+    ep_success = [False] * num_envs
 
-    # Record first frame
     if record_video:
         for i in range(num_envs):
-            ep_frames[i].append(obs["observation.images.agentview"][i].astype(np.uint8))
+            ep_frames[i].append(_get_video_frame(env, obs, i))
 
-    # ------------------------------------------------------------------
-    # Per-env state/image history and action queues
-    # ------------------------------------------------------------------
     import torch  # type: ignore
 
+    use_images = policy.image_feature is not None
+    use_env_state = policy.env_state_feature is not None
     n_obs_steps = int(policy.state_feature.window_size)
 
     task_idx_tensors = []
     for i in range(num_envs):
         obj_i, cont_i = _parse_task_indices(tasks[i])
-        task_idx_tensors.append(
-            torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device)
-        )  # (1, 2)
+        task_idx_tensors.append(torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device))
 
-    # Initialise per-env history deques
     state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
-    img_hists   = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
+    env_state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)] if use_env_state else []
+    img_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)] if use_images else []
     action_queues: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
 
     def _seed_history(i: int):
-        s = obs["observation.state"][i].astype(np.float32)
-        im = _preprocess_images(obs, i)
-        state_hists[i].append(s)
-        img_hists[i].append(im)
+        state_hists[i].append(obs["observation.state"][i].astype(np.float32))
+        if use_env_state:
+            env_state_hists[i].append(obs["observation.environment_state"][i].astype(np.float32))
+        if use_images:
+            img_hists[i].append(_preprocess_images(obs, i))
         while len(state_hists[i]) < n_obs_steps:
             state_hists[i].append(state_hists[i][-1].copy())
-            img_hists[i].append(img_hists[i][-1].copy())
+            if use_env_state:
+                env_state_hists[i].append(env_state_hists[i][-1].copy())
+            if use_images:
+                img_hists[i].append(img_hists[i][-1].copy())
 
     for i in range(num_envs):
         _seed_history(i)
 
-    # ------------------------------------------------------------------
-    # Rollout loop
-    # ------------------------------------------------------------------
     step = 0
     while not all(done) and step < horizon:
-        # Find envs whose action queue is exhausted → need policy query
         need_query = [i for i in range(num_envs) if not done[i] and not action_queues[i]]
 
         if need_query:
-            # Update history for those envs from latest obs
             for i in need_query:
                 state_hists[i].append(obs["observation.state"][i].astype(np.float32))
-                img_hists[i].append(_preprocess_images(obs, i))
+                if use_env_state:
+                    env_state_hists[i].append(obs["observation.environment_state"][i].astype(np.float32))
+                if use_images:
+                    img_hists[i].append(_preprocess_images(obs, i))
 
-            # Batch forward pass for all envs that need a query
             B_q = len(need_query)
             robot_state_batch = torch.from_numpy(
-                np.stack(
-                    [np.stack(list(state_hists[i]), axis=0) for i in need_query],
-                    axis=0,
-                )   # (B_q, n_obs_steps, state_dim)
+                np.stack([np.stack(list(state_hists[i]), axis=0) for i in need_query], axis=0)
             ).to(torch.float32).to(device)
 
-            images_batch = torch.from_numpy(
-                np.stack(
-                    [np.stack(list(img_hists[i]), axis=0) for i in need_query],
-                    axis=0,
-                )   # (B_q, n_obs_steps, n_cams, C, H, W)
-            ).to(torch.uint8).to(device)
+            raw_batch: dict[str, torch.Tensor] = {"state": robot_state_batch}
+            if use_env_state:
+                env_state_batch = torch.from_numpy(
+                    np.stack([np.stack(list(env_state_hists[i]), axis=0) for i in need_query], axis=0)
+                ).to(torch.float32).to(device)
+                raw_batch["env_state"] = env_state_batch
+            if use_images:
+                images_batch = torch.from_numpy(
+                    np.stack([np.stack(list(img_hists[i]), axis=0) for i in need_query], axis=0)
+                ).to(torch.uint8).to(device)
 
-            task_idx_batch = torch.cat(
-                [task_idx_tensors[i] for i in need_query], dim=0
-            )  # (B_q, 2)
+            task_idx_batch = torch.cat([task_idx_tensors[i] for i in need_query], dim=0)
 
-            # Normalise state
-            norm_batch = policy.processor({"state": robot_state_batch})
-            robot_state_norm = norm_batch["state"]
-
+            norm_batch = policy.processor(raw_batch)
+            model_kwargs = {
+                "robot_state": norm_batch["state"],
+                "task_indices": task_idx_batch,
+                "flow_algo": policy.model.flow_algo,
+                "batch_size": B_q,
+            }
+            if use_env_state:
+                model_kwargs["env_state"] = norm_batch["env_state"]
+            if use_images:
+                model_kwargs["images"] = images_batch
+            # print(model_kwargs)
             with torch.no_grad():
-                actions_norm = policy.model.generate_actions(
-                    robot_state=robot_state_norm,
-                    images=images_batch,
-                    task_indices=task_idx_batch,
-                    flow_algo=policy.model.flow_algo,
-                    batch_size=B_q,
-                )  # (B_q, action_horizon, action_dim)
+                actions_norm = policy.model.generate_actions(**model_kwargs)
                 actions_denorm = policy.denormalize_actions(actions_norm)
 
-            acts_np = actions_denorm[:, :n_execute].detach().cpu().numpy()  # (B_q, n_execute, action_dim)
+            acts_np = actions_denorm[:, :n_execute].detach().cpu().numpy()
             for qi, i in enumerate(need_query):
                 for t in range(acts_np.shape[1]):
                     action_queues[i].append(acts_np[qi, t, :7].astype(np.float32))
 
-        # Each env pops from its own queue; done envs get zero action (ignored)
         action_mat = np.zeros((num_envs, 7), dtype=np.float32)
         for i in range(num_envs):
             if not done[i] and action_queues[i]:
@@ -301,13 +315,14 @@ def run_batch(
             if bool(successes[i]):
                 ep_success[i] = True
 
-            step_done = bool(terminated[i] if hasattr(terminated, "__len__") else terminated) or \
-                        bool(truncated[i]   if hasattr(truncated,  "__len__") else truncated)
+            step_done = bool(terminated[i] if hasattr(terminated, "__len__") else terminated) or bool(
+                truncated[i] if hasattr(truncated, "__len__") else truncated
+            )
             if step_done or ep_success[i]:
                 done[i] = True
 
             if record_video and not done[i]:
-                ep_frames[i].append(obs["observation.images.agentview"][i].astype(np.uint8))
+                ep_frames[i].append(_get_video_frame(env, obs, i))
 
         step += 1
         running_sr = np.mean(ep_success[:num_envs]) * 100
@@ -318,11 +333,8 @@ def run_batch(
             flush=True,
         )
 
-    print()  # newline after \r
+    print()
 
-    # ------------------------------------------------------------------
-    # Save videos (threaded)
-    # ------------------------------------------------------------------
     if record_video:
         import threading
 
@@ -342,13 +354,13 @@ def run_batch(
             t.join()
 
     return {
-        "success":    ep_success,
+        "success": ep_success,
         "sum_reward": sum_rewards,
         "max_reward": max_rewards,
-        "length":     lengths,
-        "task":       tasks,
-        "actions":    [np.stack(a, axis=0) if a else np.zeros((0, 7), dtype=np.float32) for a in ep_actions],
-        "rewards":    [np.array(r, dtype=np.float32) for r in ep_rewards],
+        "length": lengths,
+        "task": tasks,
+        "actions": [np.stack(a, axis=0) if a else np.zeros((0, 7), dtype=np.float32) for a in ep_actions],
+        "rewards": [np.array(r, dtype=np.float32) for r in ep_rewards],
     }
 
 
@@ -541,37 +553,55 @@ def main():
 
     os.environ.setdefault("MUJOCO_GL", "egl")
 
-    if args.num_envs % 2 != 0:
-        raise ValueError("--num-envs must be even (ImageBasedCGWrapper requirement)")
+    # if args.num_envs % 2 != 0:
+    #     raise ValueError("--num-envs must be even (ImageBasedCGWrapper requirement)")
 
     policy = build_policy(
         checkpoint=Path(args.checkpoint),
         device=args.device,
     )
 
-    # Verify state dim matches env before full eval
-    env_task = args.task if args.task != "all" else _ALL_TASKS[0]
-    env = ImageBasedCGWrapper(
+    # Build the environment wrapper that matches the checkpoint features.
+    env_task = args.task if policy.image_feature is None else (args.task if args.task != "all" else _ALL_TASKS[0])
+    wrapper_cls = ImageBasedCGWrapper if policy.image_feature is not None else StateBasedCGWrapper
+    env = wrapper_cls(
         make_env_fn=lambda: make_env(env_task, horizon=args.horizon),
         num_envs=args.num_envs,
-        use_relative_coordinates=False,
+        use_relative_coordinates=(policy.env_state_feature is not None),
     )
-    env.train_task = "all"
+    if wrapper_cls is StateBasedCGWrapper:
+        env.train_task = "all"
+    else:
+        env.train_task = args.task
 
     fps = int(getattr(env.envs[0], "control_freq", 20))
     print(f"env control_freq={fps} Hz | num_envs={args.num_envs}")
 
-    import torch  # type: ignore
     obs, _ = env.reset()
-    state_dim = int(np.prod(policy.state_feature.shape))
+    policy_state_dim = int(np.prod(policy.state_feature.shape))
     env_state_dim = int(obs["observation.state"].shape[-1])
-    if state_dim != env_state_dim:
+    if policy_state_dim != env_state_dim:
         env.close()
         raise ValueError(
-            f"State dim mismatch: policy expects {state_dim}, "
+            f"State dim mismatch: policy expects {policy_state_dim}, "
             f"env provides {env_state_dim}. Check the checkpoint config."
         )
-    print(f"state_dim={state_dim}  image_shape={tuple(policy.image_feature.shape)}")
+    if policy.env_state_feature is not None:
+        policy_env_state_dim = int(np.prod(policy.env_state_feature.shape))
+        env_env_state_dim = int(obs["observation.environment_state"].shape[-1])
+        if policy_env_state_dim != env_env_state_dim:
+            env.close()
+            raise ValueError(
+                f"Env-state dim mismatch: policy expects {policy_env_state_dim}, "
+                f"env provides {env_env_state_dim}. Check the wrapper output."
+            )
+    if policy.image_feature is not None:
+        print(f"state_dim={policy_state_dim}  image_shape={tuple(policy.image_feature.shape)}")
+    else:
+        print(
+            f"state_dim={policy_state_dim}  "
+            f"env_state_dim={int(np.prod(policy.env_state_feature.shape)) if policy.env_state_feature is not None else 'n/a'}"
+        )
 
     # Output directory
     run_id  = time.strftime("%Y%m%d-%H%M%S")
