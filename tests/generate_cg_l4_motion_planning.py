@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Generate one-stage CG_L3 pick-and-place data using a waypoint motion planner.
+Generate one-stage CG_L4 pick-and-place data using a waypoint motion planner.
 
 This script does not load a learned policy. Instead, it:
-1. samples a fixed one-stage CG_L3 task,
+1. samples a fixed one-stage CG_L4 task,
 2. runs a scripted motion planner with OSC delta-position actions,
 3. saves successful episodes to HDF5,
 4. optionally writes debug videos.
@@ -25,11 +25,11 @@ Output HDF5 layout:
       success = True
 
 Usage:
-  python generate_cg_l3_motion_planning.py \
+  python generate_cg_l4_motion_planning.py \
       --n-success 200 \
       --num-envs 4 \
       --horizon 220 \
-      --out-dir results/cg_l3_motion_gen
+      --out-dir results/cg_l4_motion_gen
 """
 
 from __future__ import annotations
@@ -61,8 +61,8 @@ from robosuite.utils.errors import RandomizationError
 from robosuite.utils.placement_samplers import UniformApartRandomSampler
 
 
-OBJECT_NAMES = ["cross", "cube", "cylinder"]
-CONTAINER_NAMES = ["bin", "mug", "plate"]
+OBJECT_NAMES = ["cross", "cube", "cylinder", "milk"]
+CONTAINER_NAMES = ["bin", "mug", "plate", "mug_no_handle"]
 ALL_TASKS = [f"place the {obj} into the {cont}" for obj in OBJECT_NAMES for cont in CONTAINER_NAMES]
 POSED_ENTITY_NAMES = OBJECT_NAMES + CONTAINER_NAMES
 
@@ -71,7 +71,7 @@ def _setup_logger(out_dir: Path, level: str) -> logging.Logger:
     """
     Clean, single logger that writes to both stdout and a file.
     """
-    logger = logging.getLogger("cg_l3_motion_gen")
+    logger = logging.getLogger("cg_l4_motion_gen")
     logger.propagate = False
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
@@ -264,24 +264,24 @@ def fix_env_task_pointers(env) -> None:
     env.object_B_body_id = env.sim.model.body_name2id(env.object_B.root_body)
 
 
-def load_cg_l3_env_class():
+def load_cg_l4_env_class():
     """
-    Load the environment class from CG_L3.py.
+    Load the environment class from CG_L4.py.
 
-    The current repo may still export the class as CG_L2 inside CG_L3.py, so
+    The current repo may still export the class as CG_L2 inside CG_L4.py, so
     this helper accepts either symbol.
     """
-    module = importlib.import_module("robosuite.environments.manipulation.CG_L3")
-    env_cls = getattr(module, "CG_L3", None)
+    module = importlib.import_module("robosuite.environments.manipulation.CG_L4")
+    env_cls = getattr(module, "CG_L4", None)
     if env_cls is None:
         env_cls = getattr(module, "CG_L2", None)
     if env_cls is None:
-        raise AttributeError("Could not find CG_L3 or CG_L2 class in CG_L3.py")
+        raise AttributeError("Could not find CG_L4 or CG_L2 class in CG_L4.py")
     return env_cls
 
 
 def make_env(*, horizon: int):
-    env_cls = load_cg_l3_env_class()
+    env_cls = load_cg_l4_env_class()
     controller_config = load_composite_controller_config(controller="BASIC", robot="Panda")
     bootstrap_sampler_a = UniformApartRandomSampler(
         name="FullDesk_Object_A_Sampler",
@@ -327,7 +327,7 @@ def make_env(*, horizon: int):
 
 class SingleStageCGWrapper:
     """
-    Minimal vectorized wrapper around CG_L3 for planner-based generation.
+    Minimal vectorized wrapper around CG_L4 for planner-based generation.
 
     Observations returned:
       observation.state              (9,)
@@ -574,7 +574,7 @@ def generate_grasp_release_poses(
     pregrasp[2] += float(params.pregrasp_h)
 
     grasp = targets.object_pose.pos.copy()
-    grasp[2] += float(np.clip(0.08 * obj_half, 0.001, 0.004))
+    grasp[2] += float(np.clip(0.08 * obj_half, 0.001, 0.002))
 
     place = targets.container_pose.pos.copy()
     place[2] += float(_container_place_z_offset(env, obj_half_h=obj_half))
@@ -779,7 +779,7 @@ class WaypointPickPlacePlanner:
         # Open above container; object drops from height (XY over container center).
         self._append_hold(release_pos, q_path, self.GRIP_OPEN, "place", n=22)
 
-        # --- retreat: CG_L3._check_success() needs gripper_z - table_z > 0.20; release is low, so ensure
+        # --- retreat: CG_L4._check_success() needs gripper_z - table_z > 0.20; release is low, so ensure
         # the commanded retreat height clears that (not only +0.10 above a rim-level pose).
         retreat = release_pos.copy()
         retreat[2] += 0.10
@@ -875,6 +875,7 @@ class WaypointPickPlacePlanner:
         target_pos: np.ndarray,
         target_quat_xyzw: np.ndarray,
         cur_quat_xyzw: np.ndarray,
+        phase: str,
         grip_cmd: float,
     ) -> np.ndarray:
         eef_pos = _eef_site_pos(env)
@@ -887,7 +888,9 @@ class WaypointPickPlacePlanner:
         act[:3] = np.clip(err_b / _OSC_POS_MAX_M, -1.0, 1.0)
 
         # Orientation: axis-angle delta in base frame (OSC_POSE expects delta, ref frame = base).
-        if self._use_orientation_control:
+        # We only need orientation alignment for the grasp / approach. For placing, we align XY and keep
+        # orientation unchanged to avoid twisting the object while carrying / releasing.
+        if self._use_orientation_control and phase == "approach":
             q_tgt = canonicalize_quaternion(np.asarray(target_quat_xyzw, dtype=np.float32))
             q_cur = canonicalize_quaternion(np.asarray(cur_quat_xyzw, dtype=np.float32))
             q_err = quaternion_multiply(q_tgt, quaternion_inverse(q_cur))
@@ -920,7 +923,7 @@ class WaypointPickPlacePlanner:
             cur = self._poses[self._dwell_index]
             self.phase = cur.phase
             tgt_pos = self._apply_xy_feedback(env, cur.pos, cur.phase)
-            a = self._pose_to_action(env, tgt_pos, cur.quat, eef_quat_xyzw, cur.grip)
+            a = self._pose_to_action(env, tgt_pos, cur.quat, eef_quat_xyzw, cur.phase, cur.grip)
             self._dwell_remaining -= 1
             if self._dwell_remaining <= 0:
                 self._path_u = float(self._dwell_index) + 1.0
@@ -933,7 +936,7 @@ class WaypointPickPlacePlanner:
             last = self._poses[n - 1]
             self.phase = last.phase
             tgt_pos = self._apply_xy_feedback(env, last.pos, last.phase)
-            a = self._pose_to_action(env, tgt_pos, last.quat, eef_quat_xyzw, last.grip)
+            a = self._pose_to_action(env, tgt_pos, last.quat, eef_quat_xyzw, last.phase, last.grip)
             eef = _eef_site_pos(env)
             if float(np.linalg.norm(tgt_pos - eef)) < float(self.params.path_end_pos_tol_m):
                 self.done = True
@@ -942,7 +945,7 @@ class WaypointPickPlacePlanner:
 
         pos, quat, grip, ph = self._interp_state(env, self._path_u)
         self.phase = ph
-        a = self._pose_to_action(env, pos, quat, eef_quat_xyzw, grip)
+        a = self._pose_to_action(env, pos, quat, eef_quat_xyzw, ph, grip)
         self._advance_path_u()
         return a
 
@@ -1191,13 +1194,13 @@ def generate_dataset(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate CG_L3 one-stage demos with waypoint motion planning",
+        description="Generate CG_L4 one-stage demos with waypoint motion planning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--n-success", type=int, default=200, help="Successful episodes to collect")
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel environments")
     parser.add_argument("--horizon", type=int, default=220, help="Max steps per episode")
-    parser.add_argument("--out-dir", default="results/cg_l3_motion_gen")
+    parser.add_argument("--out-dir", default="results/cg_l4_motion_gen")
     parser.add_argument("--max-videos", type=int, default=20, help="Debug videos to save (0 = none)")
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)

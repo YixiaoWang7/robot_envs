@@ -74,4 +74,7 @@ python tests/generate_two_stage.py \
 
 
 
-python tests/generate_cg_l3_motion_planning.py --n-success 40 --num-envs 1 --horizon 350 --max-videos 40 --out-dir results/cg_l3_motion_real_smoke 
+python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --horizon 350 --max-videos 40 --out-dir results/cg_l4_motion_real_smoke 
+
+
+python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --horizon 350 --max-videos 40 --out-dir results/cg_l4_motion_real_smoke --use-orientation-control 

@@ -4,16 +4,28 @@ import numpy as np
 
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.arenas import TableArena
-from robosuite.models.objects import CrossObject, BoxObject, CylinderObject, Bin, mug, Plate, Mug
+from robosuite.models.objects import BoxObject, CrossObject, CylinderObject, MilkObject, Bin, mug, Plate, Mug
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.mjcf_utils import CustomMaterial
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import UniformRandomSampler, UniformApartRandomSampler
 from robosuite.utils.transform_utils import convert_quat
 
-object_A_index = {"cross": 0, "cube": 1, "cylinder": 2}
-object_B_index = {"bin": 0, "mug": 1, "plate": 2}
-one_hot_dict = {"place": 0, "the": 1, "into": 2, "cross": 3, "cube": 4, "cylinder": 5, "bin": 6, "mug": 7, "plate": 8}
+object_A_index = {"cross": 0, "cube": 1, "cylinder": 2, "milk": 3}
+object_B_index = {"bin": 0, "mug": 1, "plate": 2, "mug_no_handle": 3}
+one_hot_dict = {
+    "place": 0,
+    "the": 1,
+    "into": 2,
+    "cross": 3,
+    "cube": 4,
+    "cylinder": 5,
+    "milk": 6,
+    "bin": 7,
+    "mug": 8,
+    "plate": 9,
+    "mug_no_handle": 10,
+}
 
 class CG_L2(ManipulationEnv):
     """
@@ -452,29 +464,39 @@ class CG_L2(ManipulationEnv):
         # Arena always gets set to zero origin
         mujoco_arena.set_origin([0, 0, 0])
 
-        # initialize object A and B
-        tex_attrib = {
-            "type": "cube",
-        }
-        mat_attrib = {
-            "texrepeat": "1 1",
-            "specular": "0.4",
-            "shininess": "0.1",
-        }
-        redwood = CustomMaterial(
-            texture="WoodRed",
-            tex_name="redwood",
-            mat_name="redwood_mat",
-            tex_attrib=tex_attrib,
-            mat_attrib=mat_attrib,
-        )
-        bluewood = CustomMaterial(
-            texture="WoodBlue",
-            tex_name="bluewood",
-            mat_name="bluewood_mat",
-            tex_attrib=tex_attrib,
-            mat_attrib=mat_attrib,
-        )
+        # initialize object A and B — procedural rgba textures (distinct hues) + low specular to limit glare.
+        tex_attrib_base = {"type": "cube"}
+
+        def make_solid_mat(rgba, tex_name, mat_name, specular="0.18", shininess="0.05"):
+            return CustomMaterial(
+                texture=rgba,
+                tex_name=tex_name,
+                mat_name=mat_name,
+                tex_attrib=tex_attrib_base,
+                mat_attrib={
+                    "texrepeat": "1 1",
+                    "specular": specular,
+                    "shininess": shininess,
+                },
+            )
+
+        # Maximize hue separation (rose / green / blue / amber / purple / cyan / orange). Milk stays its own mesh.
+        col_cross = [0.93, 0.38, 0.48, 1.0]  # rose
+        col_cube = [0.30, 0.72, 0.42, 1.0]  # green
+        col_cylinder = [0.28, 0.42, 0.92, 1.0]  # blue
+        col_bin = [0.90, 0.62, 0.18, 1.0]  # amber
+        col_mug = [0.58, 0.32, 0.82, 1.0]  # purple
+        col_plate = [0.20, 0.78, 0.85, 1.0]  # cyan
+        col_mug_nh = [0.95, 0.48, 0.20, 1.0]  # orange
+
+        mat_cross = make_solid_mat(col_cross, "cg_cross_tex", "cg_cross_mat", "0.16", "0.04")
+        mat_cube = make_solid_mat(col_cube, "cg_cube_tex", "cg_cube_mat", "0.17", "0.05")
+        mat_cylinder = make_solid_mat(col_cylinder, "cg_cyl_tex", "cg_cyl_mat", "0.17", "0.05")
+        # Bin geoms reference mat name "dark_wood_mat" when use_texture=True.
+        mat_bin = make_solid_mat(col_bin, "cg_bin_tex", "dark_wood_mat", "0.15", "0.04")
+        mat_mug = make_solid_mat(col_mug, "cg_mug_tex", "cg_mug_mat", "0.18", "0.05")
+        mat_plate = make_solid_mat(col_plate, "cg_plate_tex", "cg_plate_mat", "0.17", "0.05")
+        mat_mug_nh = make_solid_mat(col_mug_nh, "cg_mug_nh_tex", "cg_mug_nh_mat", "0.18", "0.05")
 
         # ----------------------------
         # Contact friction tuning
@@ -484,40 +506,44 @@ class CG_L2(ManipulationEnv):
         # to avoid "sticky / glued" contacts.
         # OBJECT_FRICTION = [1.0, 0.01, 0.001]
         # CONTAINER_FRICTION = [1.0, 0.005, 0.0001]
+        # Manipulatable objects (primitives): rgba matches procedural texture above.
         self.cross = CrossObject(
             name="cross",
             arm_length=0.03,
             arm_width=0.01,
             height=0.03,
-            # friction=OBJECT_FRICTION,
-            rgba=[1, 0, 0, 1],
-            material=redwood,
+            rgba=col_cross,
+            material=mat_cross,
         )
         self.cube = BoxObject(
             name="cube",
             size=[0.015, 0.015, 0.015],
-            # friction=OBJECT_FRICTION,
-            rgba=[1, 0, 0, 1],
-            material=redwood,
+            rgba=col_cube,
+            material=mat_cube,
         )
         self.cylinder = CylinderObject(
             name="cylinder",
             size=[0.015, 0.015],
-            friction=[1,1,1],
-            # friction=OBJECT_FRICTION,
-            rgba=[1, 0, 0, 1],
-            material=redwood,
+            friction=[1, 1, 1],
+            rgba=col_cylinder,
+            material=mat_cylinder,
         )
+        self.milk = MilkObject(name="milk")
+        # Resize milk to be roughly cube-sized (~3cm): non-uniform scale (XY vs Z) based on milk.xml sites.
+        # milk.xml: horizontal_radius_site ~= (0.025, 0.025, 0) => r_xy ~= 0.035
+        #           bottom_site z=-0.085, top_site z=+0.075 => half-height ~= 0.085
+        scale_xy = 0.015 / 0.025
+        scale_z = 0.015 / 0.025
+        self.milk.set_scale([scale_xy, scale_xy, scale_z])
 
         self.bin = Bin(
             name="bin",
             transparent_walls=False,
             bin_size=[0.06, 0.06, 0.04],
             wall_thickness=0.005,
-            # friction=CONTAINER_FRICTION,
-            rgba=[0, 0, 1, 1],
-            use_texture=False,
-            material=bluewood,
+            rgba=col_bin,
+            use_texture=True,
+            material=mat_bin,
         )
         # self.mug = mug(
         #     name="mug",
@@ -526,7 +552,7 @@ class CG_L2(ManipulationEnv):
         #     height=0.04,
         #     thickness=0.005,
         #     rgba=[0, 0, 1, 1],
-        #     material=bluewood,
+        #     material=mat_mug,
         # )
         # Note: robosuite Mug's internal sub-objects are named "mug_*".
         # If we also name this object "mug", robosuite's prefixing logic will double-prefix
@@ -539,16 +565,24 @@ class CG_L2(ManipulationEnv):
             add_handle=True,
             handle_outer_radius=0.02,
             handle_inner_radius=0.015,
-            # friction=CONTAINER_FRICTION,
-            rgba=[0, 0, 1, 1],
-            material=bluewood,
+            rgba=col_mug,
+            material=mat_mug,
         )
         self.plate = Plate(
             name="plate",
             radius=0.03,
-            # friction=CONTAINER_FRICTION,
-            rgba=[0, 0, 1, 1],
-            material=bluewood,
+            rgba=col_plate,
+            material=mat_plate,
+        )
+        # Handle-less mug (still a Mug object, but with add_handle=False)
+        self.mug_no_handle = Mug(
+            name="mug_no_handle_container",
+            outer_radius=0.035,
+            inner_radius=0.03,
+            mug_height=0.04,
+            add_handle=False,
+            rgba=col_mug_nh,
+            material=mat_mug_nh,
         )
         if self.object_A_index == 0:
             self.object_A = self.cross
@@ -556,6 +590,8 @@ class CG_L2(ManipulationEnv):
             self.object_A = self.cube
         elif self.object_A_index == 2:
             self.object_A = self.cylinder
+        elif self.object_A_index == 3:
+            self.object_A = self.milk
 
         if self.object_B_index == 0:
             self.object_B = self.bin
@@ -563,10 +599,12 @@ class CG_L2(ManipulationEnv):
             self.object_B = self.mug
         elif self.object_B_index == 2:
             self.object_B = self.plate
+        elif self.object_B_index == 3:
+            self.object_B = self.mug_no_handle
         
-        self.object_A_list = [self.cross, self.cube, self.cylinder]
-        self.object_B_list = [self.bin, self.mug, self.plate]
-        self.objects = [self.cross, self.cube, self.cylinder, self.bin, self.mug, self.plate]
+        self.object_A_list = [self.cross, self.cube, self.cylinder, self.milk]
+        self.object_B_list = [self.bin, self.mug, self.plate, self.mug_no_handle]
+        self.objects = [self.cross, self.cube, self.cylinder, self.milk, self.bin, self.mug, self.plate, self.mug_no_handle]
 
         # Create placement initializer
         if self.placement_initializer_A is not None:
@@ -632,6 +670,8 @@ class CG_L2(ManipulationEnv):
         self.bin_body_id = self.sim.model.body_name2id(self.bin.root_body)
         self.mug_body_id = self.sim.model.body_name2id(self.mug.root_body)
         self.plate_body_id = self.sim.model.body_name2id(self.plate.root_body)
+        self.milk_body_id = self.sim.model.body_name2id(self.milk.root_body)
+        self.mug_no_handle_body_id = self.sim.model.body_name2id(self.mug_no_handle.root_body)
 
     def _setup_observables(self):
         """
@@ -673,6 +713,14 @@ class CG_L2(ManipulationEnv):
                 return convert_quat(np.array(self.sim.data.body_xquat[self.cylinder_body_id]), to="xyzw")
 
             @sensor(modality=modality)
+            def milk_pos(obs_cache):
+                return np.array(self.sim.data.body_xpos[self.milk_body_id])
+
+            @sensor(modality=modality)
+            def milk_quat(obs_cache):
+                return convert_quat(np.array(self.sim.data.body_xquat[self.milk_body_id]), to="xyzw")
+
+            @sensor(modality=modality)
             def bin_pos(obs_cache):
                 return np.array(self.sim.data.body_xpos[self.bin_body_id])
 
@@ -696,9 +744,17 @@ class CG_L2(ManipulationEnv):
             def plate_quat(obs_cache):
                 return convert_quat(np.array(self.sim.data.body_xquat[self.plate_body_id]), to="xyzw")
 
+            @sensor(modality=modality)
+            def mug_no_handle_pos(obs_cache):
+                return np.array(self.sim.data.body_xpos[self.mug_no_handle_body_id])
+
+            @sensor(modality=modality)
+            def mug_no_handle_quat(obs_cache):
+                return convert_quat(np.array(self.sim.data.body_xquat[self.mug_no_handle_body_id]), to="xyzw")
+
             sensors = [
-                cross_pos, cross_quat, cube_pos, cube_quat, cylinder_pos, cylinder_quat,
-                bin_pos, bin_quat, mug_pos, mug_quat, plate_pos, plate_quat,
+                cross_pos, cross_quat, cube_pos, cube_quat, cylinder_pos, cylinder_quat, milk_pos, milk_quat,
+                bin_pos, bin_quat, mug_pos, mug_quat, plate_pos, plate_quat, mug_no_handle_pos, mug_no_handle_quat,
             ]
 
             arm_prefixes = self._get_arm_prefixes(self.robots[0], include_robot_name=False)
@@ -844,6 +900,19 @@ class CG_L2(ManipulationEnv):
             height_check = abs(rel_pos[2]) < 0.06
 
             return radius_check and height_check
+        
+        elif self.object_B_index == 3:  # Handle-less mug case
+            cup_inner_r = self.object_B.r1
+            cup_outer_r = self.object_B.r2
+            cup_height = self.object_B.mug_height
+            horizontal_dist = np.linalg.norm(rel_pos[:2])
+            
+            radius_check = horizontal_dist < (cup_inner_r + cup_outer_r) / 2
+            height_check = (rel_pos[2] > -cup_height) and (rel_pos[2] < cup_height)
+            return radius_check and height_check
 
         return False
         
+
+# Backwards-compatible export: some code expects `CG_L4` symbol.
+CG_L4 = CG_L2
