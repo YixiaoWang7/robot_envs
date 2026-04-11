@@ -71,3 +71,7 @@ python tests/generate_two_stage.py \
   --num-envs 4 \
   --horizon 1200 \
   --out-dir results/two_stage_gen
+
+
+
+python tests/generate_cg_l3_motion_planning.py --n-success 40 --num-envs 1 --horizon 350 --max-videos 40 --out-dir results/cg_l3_motion_real_smoke 

@@ -364,7 +364,7 @@ class SingleStageCGWrapper:
         self.obs = []
         for i, env in enumerate(self.envs):
             task = str(np.random.choice(ALL_TASKS))
-            task = "place the cross into the mug"
+            # task = "place the cross into the mug"
             self.tasks[i] = task
             self.obj_indices[i] = next(idx for idx, name in enumerate(OBJECT_NAMES) if name in task)
             self.cont_indices[i] = next(idx for idx, name in enumerate(CONTAINER_NAMES) if name in task)
@@ -477,6 +477,9 @@ class GraspReleasePoses:
 
 @dataclass
 class PickPlaceParams:
+    # If True, command OSC orientation deltas (axis-angle) to track planned quaternions.
+    # If False, keep translation-only OSC (legacy / more stable on some setups).
+    use_orientation_control: bool = False
     # Legacy: full lift after grasp (unused by current planner; kept for config compatibility).
     lift_z: float = 0.26
     # Small vertical clearance after grasp before moving toward the container (m).
@@ -696,6 +699,7 @@ class WaypointPickPlacePlanner:
         self._built: bool = False
         self._plan_obj_xy: np.ndarray | None = None
         self._plan_cont_xy: np.ndarray | None = None
+        self._use_orientation_control: bool = bool(self.params.use_orientation_control)
 
     def reset(self) -> None:
         self.phase = "init"
@@ -707,6 +711,7 @@ class WaypointPickPlacePlanner:
         self._built = False
         self._plan_obj_xy = None
         self._plan_cont_xy = None
+        self._use_orientation_control = bool(self.params.use_orientation_control)
 
     def _is_grasped(self, env) -> bool:
         return bool(env._check_grasp(gripper=env.robots[0].gripper, object_geoms=env.object_A))
@@ -717,7 +722,10 @@ class WaypointPickPlacePlanner:
     def _build(self, env, eef_quat_xyzw: np.ndarray) -> None:
         p = self.params
         targets = get_target_poses(env)
-        q_path = _aligned_grasp_quat_xyzw(env, eef_quat_xyzw=eef_quat_xyzw, obj_quat_xyzw=targets.object_pose.quat)  # type: ignore[arg-type]
+        if bool(p.use_orientation_control):
+            q_path = _aligned_grasp_quat_xyzw(env, eef_quat_xyzw=eef_quat_xyzw, obj_quat_xyzw=targets.object_pose.quat)  # type: ignore[arg-type]
+        else:
+            q_path = canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
         gr = generate_grasp_release_poses(env, targets, eef_quat_xyzw=q_path, params=p)
 
         eef0 = _eef_site_pos(env)
@@ -879,12 +887,15 @@ class WaypointPickPlacePlanner:
         act[:3] = np.clip(err_b / _OSC_POS_MAX_M, -1.0, 1.0)
 
         # Orientation: axis-angle delta in base frame (OSC_POSE expects delta, ref frame = base).
-        q_tgt = canonicalize_quaternion(np.asarray(target_quat_xyzw, dtype=np.float32))
-        q_cur = canonicalize_quaternion(np.asarray(cur_quat_xyzw, dtype=np.float32))
-        q_err = quaternion_multiply(q_tgt, quaternion_inverse(q_cur))
-        rotvec_w = quat_to_rotvec(q_err)
-        rotvec_b = (Rb.T @ rotvec_w.astype(np.float32)).astype(np.float32)
-        act[3:6] = np.clip(rotvec_b / _OSC_ROT_MAX_RAD, -1.0, 1.0)
+        if self._use_orientation_control:
+            q_tgt = canonicalize_quaternion(np.asarray(target_quat_xyzw, dtype=np.float32))
+            q_cur = canonicalize_quaternion(np.asarray(cur_quat_xyzw, dtype=np.float32))
+            q_err = quaternion_multiply(q_tgt, quaternion_inverse(q_cur))
+            rotvec_w = quat_to_rotvec(q_err)
+            rotvec_b = (Rb.T @ rotvec_w.astype(np.float32)).astype(np.float32)
+            act[3:6] = np.clip(rotvec_b / _OSC_ROT_MAX_RAD, -1.0, 1.0)
+        else:
+            act[3:6] = 0.0
 
         act[6] = float(grip_cmd)
         return act
@@ -966,9 +977,14 @@ def save_episode_to_hdf5(hdf5_path: Path, ep: dict, ep_id: int) -> None:
         grp.attrs["success"] = True
 
 
-def run_batch(env: SingleStageCGWrapper, *, horizon: int) -> tuple[list[dict | None], dict]:
+def run_batch(
+    env: SingleStageCGWrapper,
+    *,
+    horizon: int,
+    planner_params: PickPlaceParams | None = None,
+) -> tuple[list[dict | None], dict]:
     obs, _ = env.reset()
-    planners = [WaypointPickPlacePlanner() for _ in range(env.num_envs)]
+    planners = [WaypointPickPlacePlanner(params=planner_params) for _ in range(env.num_envs)]
     for planner in planners:
         planner.reset()
 
@@ -1075,6 +1091,7 @@ def generate_dataset(
     n_success_episodes: int,
     horizon: int,
     hdf5_path: Path,
+    planner_params: PickPlaceParams | None = None,
     videos_dir: Path | None = None,
     max_videos: int = 0,
     fps: int = 20,
@@ -1097,7 +1114,7 @@ def generate_dataset(
         batch += 1
         log(f"[batch {batch}] start | saved={stats.saved}/{n_success_episodes}")
 
-        episodes, batch_info = run_batch(env, horizon=horizon)
+        episodes, batch_info = run_batch(env, horizon=horizon, planner_params=planner_params)
         stats.attempted += int(batch_info["num_envs"])
         base_attempt_id = stats.attempted - int(batch_info["num_envs"])
         for task in env.tasks:
@@ -1182,6 +1199,11 @@ def main():
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-level", default="INFO", help="Logging level (e.g. INFO, DEBUG)")
+    parser.add_argument(
+        "--use-orientation-control",
+        action="store_true",
+        help="Enable OSC orientation deltas + object-aligned grasp yaw (cross/cube).",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -1207,6 +1229,7 @@ def main():
         n_success_episodes=args.n_success,
         horizon=args.horizon,
         hdf5_path=hdf5_path,
+        planner_params=PickPlaceParams(use_orientation_control=bool(args.use_orientation_control)),
         videos_dir=videos_dir,
         max_videos=args.max_videos,
         fps=args.fps,
