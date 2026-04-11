@@ -178,6 +178,48 @@ def quat_to_rotvec(q_xyzw: np.ndarray) -> np.ndarray:
     return axis * angle
 
 
+def _wrap_to_pi(a: float) -> float:
+    a = float(a)
+    return float((a + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _nearest_equiv_yaw(desired_yaw: float, current_yaw: float, *, symmetry: int) -> float:
+    """
+    Choose the yaw equivalent (mod 2pi/symmetry) closest to current_yaw.
+    symmetry=4 means 90-degree rotational symmetry.
+    """
+    base = float(desired_yaw)
+    cur = float(current_yaw)
+    step = (2.0 * np.pi) / max(int(symmetry), 1)
+    candidates = [base + k * step for k in range(int(symmetry))]
+    best = candidates[0]
+    best_abs = 1e9
+    for c in candidates:
+        d = abs(_wrap_to_pi(c - cur))
+        if d < best_abs:
+            best_abs = d
+            best = c
+    return float(cur + _wrap_to_pi(best - cur))
+
+
+def _aligned_grasp_quat_xyzw(env, *, eef_quat_xyzw: np.ndarray, obj_quat_xyzw: np.ndarray) -> np.ndarray:
+    """
+    Keep roll/pitch stable, but align yaw so the gripper closes along the object's main axes.
+
+    This helps cross / cube grasps present a flatter contact surface (less edge / corner contact).
+    """
+    eef_r, eef_p, eef_y = quat_to_euler_xyz(np.asarray(eef_quat_xyzw, dtype=np.float32))
+    _obj_r, _obj_p, obj_y = quat_to_euler_xyz(np.asarray(obj_quat_xyzw, dtype=np.float32))
+
+    obj_idx = int(getattr(env, "object_A_index", 0))
+    # cross (0) and cube (1): 90-degree symmetry around vertical axis.
+    if obj_idx in (0, 1):
+        yaw = _nearest_equiv_yaw(obj_y, eef_y, symmetry=4)
+        return euler_xyz_to_quat(eef_r, eef_p, yaw)
+    # cylinder (2): yaw doesn't matter much; keep current.
+    return canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
+
+
 def transform_to_relative_coordinates(eef_pos: np.ndarray, eef_quat: np.ndarray, obj_data: np.ndarray) -> np.ndarray:
     obj_pos = obj_data[:3]
     obj_quat = obj_data[3:7]
@@ -574,6 +616,7 @@ def quat_slerp(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray, t: float) -> np.ndarray
 
 # Matches default composite BASIC + OSC_POSE for Panda (see robosuite basic.json).
 _OSC_POS_MAX_M = 0.05
+_OSC_ROT_MAX_RAD = 0.5
 
 
 def _robot_base_rotmat(env) -> np.ndarray:
@@ -674,7 +717,8 @@ class WaypointPickPlacePlanner:
     def _build(self, env, eef_quat_xyzw: np.ndarray) -> None:
         p = self.params
         targets = get_target_poses(env)
-        gr = generate_grasp_release_poses(env, targets, eef_quat_xyzw=eef_quat_xyzw, params=p)
+        q_path = _aligned_grasp_quat_xyzw(env, eef_quat_xyzw=eef_quat_xyzw, obj_quat_xyzw=targets.object_pose.quat)  # type: ignore[arg-type]
+        gr = generate_grasp_release_poses(env, targets, eef_quat_xyzw=q_path, params=p)
 
         eef0 = _eef_site_pos(env)
         q_eef = canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
@@ -683,7 +727,6 @@ class WaypointPickPlacePlanner:
         self._plan_cont_xy = env.sim.data.body_xpos[env.object_B_body_id][:2].copy()
 
         pre, grsp = gr.pregrasp, gr.grasp
-        q_path = q_eef
         table_z = float(env.model.mujoco_arena.table_offset[2])
 
         # --- approach: start -> pregrasp -> grasp ---
@@ -818,7 +861,14 @@ class WaypointPickPlacePlanner:
 
         self._path_u = u_next
 
-    def _pose_to_action(self, env, target_pos: np.ndarray, _target_quat: np.ndarray, grip_cmd: float) -> np.ndarray:
+    def _pose_to_action(
+        self,
+        env,
+        target_pos: np.ndarray,
+        target_quat_xyzw: np.ndarray,
+        cur_quat_xyzw: np.ndarray,
+        grip_cmd: float,
+    ) -> np.ndarray:
         eef_pos = _eef_site_pos(env)
         Rb = _robot_base_rotmat(env)
         err_w = (target_pos - eef_pos).astype(np.float32)
@@ -828,9 +878,13 @@ class WaypointPickPlacePlanner:
         act = np.zeros(7, dtype=np.float32)
         act[:3] = np.clip(err_b / _OSC_POS_MAX_M, -1.0, 1.0)
 
-        # Translation-only plan. Previously we tracked waypoint quat vs mat2quat(site) / frozen reset quat, which
-        # produced a large bogus orientation error at the start (different frames + arm motion), i.e. visible twist.
-        act[3:6] = 0.0
+        # Orientation: axis-angle delta in base frame (OSC_POSE expects delta, ref frame = base).
+        q_tgt = canonicalize_quaternion(np.asarray(target_quat_xyzw, dtype=np.float32))
+        q_cur = canonicalize_quaternion(np.asarray(cur_quat_xyzw, dtype=np.float32))
+        q_err = quaternion_multiply(q_tgt, quaternion_inverse(q_cur))
+        rotvec_w = quat_to_rotvec(q_err)
+        rotvec_b = (Rb.T @ rotvec_w.astype(np.float32)).astype(np.float32)
+        act[3:6] = np.clip(rotvec_b / _OSC_ROT_MAX_RAD, -1.0, 1.0)
 
         act[6] = float(grip_cmd)
         return act
@@ -852,7 +906,7 @@ class WaypointPickPlacePlanner:
             cur = self._poses[self._dwell_index]
             self.phase = cur.phase
             tgt_pos = self._apply_xy_feedback(env, cur.pos, cur.phase)
-            a = self._pose_to_action(env, tgt_pos, cur.quat, cur.grip)
+            a = self._pose_to_action(env, tgt_pos, cur.quat, eef_quat_xyzw, cur.grip)
             self._dwell_remaining -= 1
             if self._dwell_remaining <= 0:
                 self._path_u = float(self._dwell_index) + 1.0
@@ -865,7 +919,7 @@ class WaypointPickPlacePlanner:
             last = self._poses[n - 1]
             self.phase = last.phase
             tgt_pos = self._apply_xy_feedback(env, last.pos, last.phase)
-            a = self._pose_to_action(env, tgt_pos, last.quat, last.grip)
+            a = self._pose_to_action(env, tgt_pos, last.quat, eef_quat_xyzw, last.grip)
             eef = _eef_site_pos(env)
             if float(np.linalg.norm(tgt_pos - eef)) < float(self.params.path_end_pos_tol_m):
                 self.done = True
@@ -874,7 +928,7 @@ class WaypointPickPlacePlanner:
 
         pos, quat, grip, ph = self._interp_state(env, self._path_u)
         self.phase = ph
-        a = self._pose_to_action(env, pos, quat, grip)
+        a = self._pose_to_action(env, pos, quat, eef_quat_xyzw, grip)
         self._advance_path_u()
         return a
 
