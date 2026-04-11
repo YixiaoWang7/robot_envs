@@ -4,7 +4,7 @@ import numpy as np
 
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.arenas import TableArena
-from robosuite.models.objects import CrossObject, BoxObject, CylinderObject, Bin, Cup, Plate, Mug
+from robosuite.models.objects import CrossObject, BoxObject, CylinderObject, Bin, mug, Plate, Mug
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.mjcf_utils import CustomMaterial
 from robosuite.utils.observables import Observable, sensor
@@ -12,8 +12,8 @@ from robosuite.utils.placement_samplers import UniformRandomSampler, UniformApar
 from robosuite.utils.transform_utils import convert_quat
 
 object_A_index = {"cross": 0, "cube": 1, "cylinder": 2}
-object_B_index = {"bin": 0, "cup": 1, "plate": 2}
-one_hot_dict = {"place": 0, "the": 1, "into": 2, "cross": 3, "cube": 4, "cylinder": 5, "bin": 6, "cup": 7, "plate": 8}
+object_B_index = {"bin": 0, "mug": 1, "plate": 2}
+one_hot_dict = {"place": 0, "the": 1, "into": 2, "cross": 3, "cube": 4, "cylinder": 5, "bin": 6, "mug": 7, "plate": 8}
 
 class CG_L2(ManipulationEnv):
     """
@@ -300,24 +300,26 @@ class CG_L2(ManipulationEnv):
         # "diagcorner":[[0,1],[1,0],[1,2],[2,0],[2,1]]
         
         from random import choice
+        num_A = len(object_A_index)  # 3
+        num_B = len(object_B_index)  # 3
         if self.strategy == "all":
-            random_list = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)] # all
+            random_list = [(a, b) for a in range(num_A) for b in range(num_B)]  # all 3x3
         elif self.strategy == "L":
-            random_list = [(1, 1), (1, 2), (2, 1), (2, 2)] # L-unseen
+            random_list = [(1, 1), (1, 2), (2, 1), (2, 2)]
         elif self.strategy == "only-00":
-            random_list = [(0, 0)] # only-00
+            random_list = [(0, 0)]
         elif self.strategy == "S":
-            random_list = [(0, 2), (1, 0), (2, 0), (2, 1)] # S-unseen
+            random_list = [(0, 2), (1, 0), (2, 0), (2, 1)]
         elif self.strategy == "diag":
-            random_list = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] # diag-unseen
+            random_list = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
         elif self.strategy == "L2":
-            random_list = [(0, 0), (0, 2), (2, 0), (2, 2)] # L2-unseen
+            random_list = [(0, 0), (0, 2), (2, 0), (2, 2)]
         elif self.strategy == "Sfull":
-            random_list = [(0, 2), (1, 0), (2, 1)] # Sfull-unseen
+            random_list = [(0, 2), (1, 0), (2, 1)]
         elif self.strategy == "diagmid":
-            random_list = [(0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] # diagmid-unseen
+            random_list = [(0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
         elif self.strategy == "diagcorner":
-            random_list = [(0, 1), (1, 0), (1, 2), (2, 0), (2, 1)] # diagcorner-unseen
+            random_list = [(0, 1), (1, 0), (1, 2), (2, 0), (2, 1)]
         else:
             raise ValueError(f"Invalid strategy: {self.strategy}")
         
@@ -486,7 +488,7 @@ class CG_L2(ManipulationEnv):
             name="cross",
             arm_length=0.03,
             arm_width=0.01,
-            height=0.02,
+            height=0.03,
             # friction=OBJECT_FRICTION,
             rgba=[1, 0, 0, 1],
             material=redwood,
@@ -517,8 +519,8 @@ class CG_L2(ManipulationEnv):
             use_texture=False,
             material=bluewood,
         )
-        # self.cup = Cup(
-        #     name="cup",
+        # self.mug = mug(
+        #     name="mug",
         #     outer_radius=0.035,
         #     inner_radius=0.03,
         #     height=0.04,
@@ -526,8 +528,11 @@ class CG_L2(ManipulationEnv):
         #     rgba=[0, 0, 1, 1],
         #     material=bluewood,
         # )
-        self.cup = Mug(
-            name="cup",
+        # Note: robosuite Mug's internal sub-objects are named "mug_*".
+        # If we also name this object "mug", robosuite's prefixing logic will double-prefix
+        # names at lookup time (e.g. "mug_mug_body_*"), causing geom-id mapping failures.
+        self.mug = Mug(
+            name="mug_container",
             outer_radius=0.035,
             inner_radius=0.03,
             mug_height=0.04,
@@ -555,13 +560,13 @@ class CG_L2(ManipulationEnv):
         if self.object_B_index == 0:
             self.object_B = self.bin
         elif self.object_B_index == 1:
-            self.object_B = self.cup
+            self.object_B = self.mug
         elif self.object_B_index == 2:
             self.object_B = self.plate
         
         self.object_A_list = [self.cross, self.cube, self.cylinder]
-        self.object_B_list = [self.bin, self.cup, self.plate]
-        self.objects = [self.cross, self.cube, self.cylinder, self.bin, self.cup, self.plate]
+        self.object_B_list = [self.bin, self.mug, self.plate]
+        self.objects = [self.cross, self.cube, self.cylinder, self.bin, self.mug, self.plate]
 
         # Create placement initializer
         if self.placement_initializer_A is not None:
@@ -621,11 +626,11 @@ class CG_L2(ManipulationEnv):
         if self.object_B_init_pos is None:
             self.object_B_init_pos = self.sim.data.body_xpos[self.object_B_body_id].copy()
 
-        self.cross_body_id = self.sim.model.body_name2id(self.cross.root_body) 
+        self.cross_body_id = self.sim.model.body_name2id(self.cross.root_body)
         self.cube_body_id = self.sim.model.body_name2id(self.cube.root_body)
         self.cylinder_body_id = self.sim.model.body_name2id(self.cylinder.root_body)
         self.bin_body_id = self.sim.model.body_name2id(self.bin.root_body)
-        self.cup_body_id = self.sim.model.body_name2id(self.cup.root_body)
+        self.mug_body_id = self.sim.model.body_name2id(self.mug.root_body)
         self.plate_body_id = self.sim.model.body_name2id(self.plate.root_body)
 
     def _setup_observables(self):
@@ -676,12 +681,12 @@ class CG_L2(ManipulationEnv):
                 return convert_quat(np.array(self.sim.data.body_xquat[self.bin_body_id]), to="xyzw")
 
             @sensor(modality=modality)
-            def cup_pos(obs_cache):
-                return np.array(self.sim.data.body_xpos[self.cup_body_id])
+            def mug_pos(obs_cache):
+                return np.array(self.sim.data.body_xpos[self.mug_body_id])
 
             @sensor(modality=modality)
-            def cup_quat(obs_cache):
-                return convert_quat(np.array(self.sim.data.body_xquat[self.cup_body_id]), to="xyzw")
+            def mug_quat(obs_cache):
+                return convert_quat(np.array(self.sim.data.body_xquat[self.mug_body_id]), to="xyzw")
 
             @sensor(modality=modality)
             def plate_pos(obs_cache):
@@ -693,7 +698,7 @@ class CG_L2(ManipulationEnv):
 
             sensors = [
                 cross_pos, cross_quat, cube_pos, cube_quat, cylinder_pos, cylinder_quat,
-                bin_pos, bin_quat, cup_pos, cup_quat, plate_pos, plate_quat
+                bin_pos, bin_quat, mug_pos, mug_quat, plate_pos, plate_quat,
             ]
 
             arm_prefixes = self._get_arm_prefixes(self.robots[0], include_robot_name=False)
@@ -818,14 +823,14 @@ class CG_L2(ManipulationEnv):
                         
             return x_check and y_check and z_check
 
-        elif self.object_B_index == 1:  # Cup case
-            cup_inner_r = self.object_B.r1
-            cup_outer_r = self.object_B.r2
-            cup_height = self.object_B.mug_height
+        elif self.object_B_index == 1:  # mug case
+            mug_inner_r = self.object_B.r1
+            mug_outer_r = self.object_B.r2
+            mug_height = self.object_B.mug_height
             horizontal_dist = np.linalg.norm(rel_pos[:2])
             
-            radius_check = horizontal_dist < (cup_inner_r + cup_outer_r) / 2
-            height_check = (rel_pos[2] > -cup_height / 1) and (rel_pos[2] < cup_height / 1)
+            radius_check = horizontal_dist < (mug_inner_r + mug_outer_r) / 2
+            height_check = (rel_pos[2] > -mug_height) and (rel_pos[2] < mug_height)
             
             return radius_check and height_check
         
@@ -839,6 +844,6 @@ class CG_L2(ManipulationEnv):
             height_check = abs(rel_pos[2]) < 0.06
 
             return radius_check and height_check
-        
+
         return False
         

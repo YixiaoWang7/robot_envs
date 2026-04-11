@@ -61,3 +61,13 @@ python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolic
 
 
 python tests/eval_policy.py   --checkpoint /home/yixiao/Documents/code/robopolicy/runs/state_all_10kstep/checkpoints/ckpt_step_0100000.pt   --n-episodes 100 --num-envs 4 --horizon 400   --n-execute 8 --device cuda:1   --max-videos 24 --out-dir results/state_direct
+
+
+
+python tests/generate_two_stage.py \
+  --checkpoint /home/yixiao/Documents/code/robopolicy/runs/state_all_10kstep/checkpoints/ckpt_step_0100000.pt \
+  --n-success 50 \
+  --max-videos 50 \
+  --num-envs 4 \
+  --horizon 1200 \
+  --out-dir results/two_stage_gen
