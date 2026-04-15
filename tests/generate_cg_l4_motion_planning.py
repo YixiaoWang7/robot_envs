@@ -43,7 +43,7 @@ import os
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import h5py
@@ -223,6 +223,28 @@ def _aligned_grasp_quat_xyzw(env, *, eef_quat_xyzw: np.ndarray, obj_quat_xyzw: n
         return euler_xyz_to_quat(eef_r, eef_p, yaw)
     # cylinder (2): yaw doesn't matter much; keep current.
     return canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
+
+
+def _yaw_only_aligned_grasp_quat_xyzw(env, *, eef_quat_xyzw: np.ndarray, obj_quat_xyzw: np.ndarray) -> np.ndarray:
+    """
+    Like `_aligned_grasp_quat_xyzw`, but enforces a *pure yaw* change about the vertical axis.
+
+    - Keeps the gripper "vertical" (no roll/pitch adjustment)
+    - Chooses the nearest equivalent yaw under 90-degree symmetry (cross/cube), so the required
+      rotation magnitude is minimal (<= 45 degrees).
+    """
+    q_cur = canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
+    _eef_r, _eef_p, eef_y = quat_to_euler_xyz(q_cur)
+    _obj_r, _obj_p, obj_y = quat_to_euler_xyz(np.asarray(obj_quat_xyzw, dtype=np.float32))
+
+    obj_idx = int(getattr(env, "object_A_index", 0))
+    if obj_idx not in (0, 1):
+        return q_cur
+
+    desired_yaw = _nearest_equiv_yaw(obj_y, eef_y, symmetry=4)
+    delta_yaw = _wrap_to_pi(desired_yaw - float(eef_y))
+    q_delta = euler_xyz_to_quat(0.0, 0.0, float(delta_yaw))
+    return canonicalize_quaternion(quaternion_multiply(q_delta, q_cur))
 
 
 def transform_to_relative_coordinates(eef_pos: np.ndarray, eef_quat: np.ndarray, obj_data: np.ndarray) -> np.ndarray:
@@ -480,11 +502,34 @@ class GraspReleasePoses:
     place: Pose
 
 
+@dataclass(frozen=True)
+class StageOffsetRule:
+    """
+    Optional, manually-tuned XYZ offsets (world frame, meters) applied to stage target points.
+
+    Matching rules:
+    - `stage` must match exactly (e.g. "pregrasp", "grasp", "preplace", "place")
+    - `object` / `container` are optional; when provided they must match names in
+      `OBJECT_NAMES` / `CONTAINER_NAMES`.
+    - Offsets are additive if multiple rules match.
+    """
+
+    stage: str
+    delta_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    object: str | None = None
+    container: str | None = None
+
+
 @dataclass
 class PickPlaceParams:
     # If True, command OSC orientation deltas (axis-angle) to track planned quaternions.
     # If False, keep translation-only OSC (legacy / more stable on some setups).
     use_orientation_control: bool = False
+    # If False, never do grasp yaw alignment / rotation stages (even for cross/cube).
+    rotate_for_grasp_enable: bool = True
+    # Optional manual offsets for different object/container combinations.
+    # Applied to the generated stage targets in `generate_grasp_release_poses()`.
+    stage_offset_rules: list[StageOffsetRule] = field(default_factory=list)
     # Legacy: full lift after grasp (unused by current planner; kept for config compatibility).
     lift_z: float = 0.26
     # Small vertical clearance after grasp before moving toward the container (m).
@@ -639,6 +684,29 @@ def generate_grasp_release_poses(
         grasp = grasp0
         pregrasp = pregrasp0
 
+    def _name_or(names: list[str], idx: int, default: str) -> str:
+        return names[idx] if 0 <= int(idx) < len(names) else default
+
+    def _stage_offset(stage: str) -> np.ndarray:
+        obj = _name_or(OBJECT_NAMES, int(getattr(env, "object_A_index", -1)), "obj")
+        cont = _name_or(CONTAINER_NAMES, int(getattr(env, "object_B_index", -1)), "cont")
+        d = np.zeros(3, dtype=np.float32)
+        for rule in params.stage_offset_rules:
+            if str(rule.stage) != str(stage):
+                continue
+            if rule.object is not None and str(rule.object) != obj:
+                continue
+            if rule.container is not None and str(rule.container) != cont:
+                continue
+            d += np.asarray(rule.delta_xyz, dtype=np.float32)
+        return d
+
+    # Manual, object/container-specific offsets (world frame).
+    pregrasp = (pregrasp + _stage_offset("pregrasp")).astype(np.float32)
+    grasp = (grasp + _stage_offset("grasp")).astype(np.float32)
+    preplace = (preplace + _stage_offset("preplace")).astype(np.float32)
+    place = (place + _stage_offset("place")).astype(np.float32)
+
     # Safety: keep all Z above the table.
     table_z = float(env.model.mujoco_arena.table_offset[2])
     z_floor = table_z + 0.01
@@ -781,8 +849,12 @@ class WaypointPickPlacePlanner:
     def _build(self, env, eef_quat_xyzw: np.ndarray) -> None:
         p = self.params
         targets = get_target_poses(env)
-        if bool(p.use_orientation_control):
-            q_path = _aligned_grasp_quat_xyzw(env, eef_quat_xyzw=eef_quat_xyzw, obj_quat_xyzw=targets.object_pose.quat)  # type: ignore[arg-type]
+        if bool(p.use_orientation_control) and bool(p.rotate_for_grasp_enable):
+            q_path = _yaw_only_aligned_grasp_quat_xyzw(
+                env,
+                eef_quat_xyzw=eef_quat_xyzw,
+                obj_quat_xyzw=targets.object_pose.quat,  # type: ignore[arg-type]
+            )
         else:
             q_path = canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
         gr = generate_grasp_release_poses(env, targets, eef_quat_xyzw=q_path, params=p)
@@ -1072,7 +1144,7 @@ class PickPlaceWaypointGenerator:
 
         quat_xyzw = None
 
-        return [
+        waypoints: list[SimpleWaypoint] = [
             SimpleWaypoint(
                 pos=gr.pregrasp.pos.astype(np.float32),
                 quat_xyzw=quat_xyzw,
@@ -1080,9 +1152,30 @@ class PickPlaceWaypointGenerator:
                 gripper_hold=-1.0,
                 name="pregrasp",
             ),
+        ]
+
+        obj_idx = int(getattr(env, "object_A_index", 0))
+        # Only rotate-for-grasp for objects that benefit from yaw alignment.
+        # Cylinder (2) does not need rotation.
+        if bool(self.params.use_orientation_control) and bool(self.params.rotate_for_grasp_enable) and (obj_idx in (0, 1)):
+            waypoints.append(
+                SimpleWaypoint(
+                    pos=gr.pregrasp.pos.astype(np.float32),
+                    # Target orientation will be computed at runtime to only rotate yaw
+                    # relative to the current EEF orientation at pregrasp.
+                    quat_xyzw=None,
+                    gripper_move=-1.0,
+                    gripper_hold=-1.0,
+                    name="rotate_for_grasp",
+                    repeat=6,
+                )
+            )
+
+        waypoints += [
             SimpleWaypoint(
                 pos=gr.grasp.pos.astype(np.float32),
-                quat_xyzw=quat_xyzw,
+                # Same yaw-aligned orientation target as rotate_for_grasp (computed at runtime)
+                quat_xyzw=None,
                 # Only close after reaching grasp.
                 gripper_move=-1.0,
                 gripper_hold=1.0,
@@ -1121,6 +1214,8 @@ class PickPlaceWaypointGenerator:
                 name="lift",
             ),
         ]
+
+        return waypoints
 
 
 class WaypointSequencer:
@@ -1214,10 +1309,11 @@ class SimplePickPlacePlanner:
                 max_step_size=float(max_step_size),
                 pos_tolerance=float(pos_tol),
                 osc_pos_limit=float(osc_pos_limit),
-                use_orientation=False,
-                rot_tolerance_rad=0.0,
+                # Orientation control is only used when a waypoint provides a target quaternion.
+                use_orientation=True,
+                rot_tolerance_rad=0.15,
                 osc_rot_limit_rad=0.5,
-                max_rot_step_rad=0.0,
+                max_rot_step_rad=0.08,
                 ignore_position=False,
             )
         )
@@ -1226,6 +1322,7 @@ class SimplePickPlacePlanner:
         self.pregrasp_pos: np.ndarray | None = None
         self.last_eef_pos: np.ndarray | None = None
         self.last_waypoint: str | None = None
+        self._cached_yaw_target_quat_xyzw: np.ndarray | None = None
 
     def reset(self) -> None:
         self.phase = "init"
@@ -1233,6 +1330,7 @@ class SimplePickPlacePlanner:
         self.pregrasp_pos = None
         self.last_eef_pos = None
         self.last_waypoint = None
+        self._cached_yaw_target_quat_xyzw = None
         self.seq.reset([])
 
     def get_action(self, env, *, eef_quat_xyzw: np.ndarray) -> np.ndarray:
@@ -1254,12 +1352,35 @@ class SimplePickPlacePlanner:
             return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 
         self.phase = cur.name
-        act, _pos_dist, _rot_dist, _err = self.ctrl.compute_action(env, target_pos=cur.pos, target_quat_xyzw=cur.quat_xyzw)
+        # Rotation is optional. If disabled, we always run position-only OSC.
+        target_quat = cur.quat_xyzw
+        if cur.name not in ("rotate_for_grasp", "grasp"):
+            self._cached_yaw_target_quat_xyzw = None
+
+        if (
+            cur.name in ("rotate_for_grasp", "grasp")
+            and bool(self.generator.params.use_orientation_control)
+            and bool(self.generator.params.rotate_for_grasp_enable)
+        ):
+            if self._cached_yaw_target_quat_xyzw is None:
+                targets = get_target_poses(env)
+                self._cached_yaw_target_quat_xyzw = _yaw_only_aligned_grasp_quat_xyzw(
+                    env,
+                    eef_quat_xyzw=canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32)),
+                    obj_quat_xyzw=targets.object_pose.quat,  # type: ignore[arg-type]
+                ).astype(np.float32)
+            target_quat = self._cached_yaw_target_quat_xyzw
+        else:
+            target_quat = None
+
+        act, pos_dist, rot_dist, _err = self.ctrl.compute_action(env, target_pos=cur.pos, target_quat_xyzw=target_quat)
         act = act.astype(np.float32)
         eef = _eef_site_pos(env)
-        reached = float(np.linalg.norm(cur.pos - eef)) <= float(self.seq.pos_tol)
+        reached_pos = float(pos_dist) <= float(self.seq.pos_tol)
+        reached_rot = (target_quat is None) or (float(rot_dist) <= float(self.ctrl.params.rot_tolerance_rad))
+        reached = bool(reached_pos and reached_rot)
         # While moving: gripper_move. When holding (dwell) at waypoint: gripper_hold.
-        if self.seq.is_holding() or (reached and int(cur.repeat) > 2):
+        if self.seq.is_holding() or (reached and int(cur.repeat) > 1):
             act[6] = float(cur.gripper_hold)
         else:
             act[6] = float(cur.gripper_move)
@@ -1558,7 +1679,12 @@ def main():
     parser.add_argument(
         "--use-orientation-control",
         action="store_true",
-        help="Enable OSC orientation deltas + object-aligned grasp yaw (cross/cube).",
+        help="Enable OSC orientation deltas. (Grasp yaw alignment can be disabled separately.)",
+    )
+    parser.add_argument(
+        "--no-rotate-for-grasp",
+        action="store_true",
+        help="Disable rotate_for_grasp + yaw alignment entirely (position-only grasp).",
     )
     args = parser.parse_args()
 
@@ -1585,7 +1711,15 @@ def main():
         n_success_episodes=args.n_success,
         horizon=args.horizon,
         hdf5_path=hdf5_path,
-        planner_params=PickPlaceParams(use_orientation_control=bool(args.use_orientation_control)),
+        planner_params=PickPlaceParams(
+            use_orientation_control=bool(args.use_orientation_control),
+            rotate_for_grasp_enable=not bool(args.no_rotate_for_grasp),
+            stage_offset_rules=[
+                StageOffsetRule(stage="place", container="mug", delta_xyz=(0.00, 0.00, 0.05)),
+                StageOffsetRule(stage="place", container="mug_no_handle", delta_xyz=(0.00, 0.00, 0.05)),
+                StageOffsetRule(stage="place", container="bin", delta_xyz=(0.00, 0.00, 0.02)),
+            ],
+        ),
         videos_dir=videos_dir,
         max_videos=args.max_videos,
         fps=args.fps,
