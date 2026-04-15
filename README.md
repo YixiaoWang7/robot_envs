@@ -85,3 +85,13 @@ python tests/generate_cg_l4_motion_planning.py --n-success 1 --num-envs 1 --hori
 
 
 python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --horizon 500 --out-dir results/test --max-videos 40
+
+
+
+
+python tests/generate_cg_l4_motion_planning.py \
+  --per-task-success 500 \
+  --num-envs 1 \
+  --horizon 220 \
+  --out-dir /mnt/ssd/yixiao/cg/4tasks \
+  --max-videos 0

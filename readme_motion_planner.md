@@ -9,7 +9,8 @@ This document explains how to run and tune the waypoint motion planner in `repos
 - **Environment**: robosuite CG_L4 (one-stage “place the {object} into the {container}”)
 - **Planner**: scripted waypoint sequence (pregrasp → (optional rotate) → grasp → post_grasp_lift → prerelease → release → lift)
 - **Controller**: OSC (`OSC_POSE`) with **delta actions**; position-only by default, optional yaw-only orientation control
-- **Artifacts**: successful demos saved to **HDF5**, optional debug **MP4 videos**, plus logs and metadata
+- **Artifacts (dataset)**: for each successful demo, saves **one `demo.hdf5`** (numerical values) and **two MP4s** (one per camera)
+- **Artifacts (optional review)**: optional side-by-side “review” videos for quickly inspecting behaviors, plus logs and metadata
 
 ### Quickstart
 
@@ -30,17 +31,40 @@ python repos/robot_envs/tests/generate_cg_l4_motion_planning.py \
   --max-videos 20
 ```
 
+Generate a fixed number of successes **per task** (16 tasks total):
+
+```bash
+python repos/robot_envs/tests/generate_cg_l4_motion_planning.py \
+  --per-task-success 500 \
+  --num-envs 4 \
+  --horizon 220 \
+  --out-dir repos/robot_envs/results/test \
+  --max-videos 0
+```
+
 Notes:
 - The script sets `MUJOCO_GL=egl` by default.
-- Videos are saved for both successes and failures (bounded by `--max-videos`).
+- The structured dataset videos are saved **per successful demo** (one MP4 per camera).
+- The optional `videos/` “review videos” are saved for both successes and failures (bounded by `--max-videos`).
 
 ### Output directory layout
 
 For `--out-dir X`, each run writes a new folder:
 
 - **`X/gen_YYYYMMDD-HHMMSS/`**
-  - **`demos.hdf5`**: saved successful episodes (one `demo_{k}` group per saved episode)
-  - **`videos/`** (only if `--max-videos > 0`): debug videos `ep{attempt_id}_{task}_{success|fail}.mp4`
+  - **`demos/`**: structured dataset for **total-mode** (`--n-success`, only successful demos are saved)
+    - **`demo_000000/`**
+      - **`demo.hdf5`**: numerical values (eef pose, gripper state, object state, actions, task string)
+      - **`agentview.mp4`**: RGB frames for `agentview` camera
+      - **`robot0_eye_in_hand.mp4`**: RGB frames for `robot0_eye_in_hand` camera
+    - **`demo_000001/`** ...
+  - **`task/`**: structured dataset for **per-task mode** (`--per-task-success`)
+    - **`cross_into_bin/`**
+      - **`demo_000000/`** (triplet: `demo.hdf5`, `agentview.mp4`, `robot0_eye_in_hand.mp4`)
+      - **`demo_000001/`** ...
+    - **`cross_into_mug/`** ...
+    - (16 subfolders total: 4 objects × 4 containers)
+  - **`videos/`** (only if `--max-videos > 0`): optional “review videos” `ep{attempt_id}_{task}_{success|fail}.mp4` (side-by-side cameras)
   - **`args.json`**: the parsed CLI args
   - **`gen.log`**: log file (same content as stdout)
   - **`gen_info.json`**: aggregate generation stats (overall + per-task breakdown)
@@ -48,8 +72,13 @@ For `--out-dir X`, each run writes a new folder:
 ### CLI arguments (every argument explained)
 
 - **`--n-success`** (int, default: 200)
-  - Number of **successful episodes to save** into `demos.hdf5`.
+  - Number of **successful demos to save** into `demos/` (one folder per demo).
   - The script keeps sampling rollouts until it has saved this many successes.
+
+- **`--per-task-success`** (int, default: 0)
+  - If **> 0**, runs **all 16 tasks** and saves this many successful demos **per task**.
+  - Output goes to `task/<obj_into_cont>/demo_XXXXXX/`.
+  - If set, `--n-success` is not used for stopping (the per-task quota is used instead).
 
 - **`--num-envs`** (int, default: 1)
   - Number of **parallel environments** to run in a batch.
@@ -62,8 +91,9 @@ For `--out-dir X`, each run writes a new folder:
   - Parent output directory. The script creates a timestamped run folder under this directory.
 
 - **`--max-videos`** (int, default: 20)
-  - Maximum number of MP4 videos to write to `videos/`.
-  - Set to **0** to disable video writing entirely.
+  - Maximum number of optional “review” MP4 videos to write to `videos/` (side-by-side cameras).
+  - Set to **0** to disable review video writing.
+  - This does **not** affect the dataset: successful demos still save `agentview.mp4` and `robot0_eye_in_hand.mp4` under `demos/`.
 
 - **`--fps`** (int, default: 20)
   - Output video framerate (frames per second).

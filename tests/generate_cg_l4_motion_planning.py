@@ -283,6 +283,25 @@ def _task_short(task: str) -> str:
     return f"{obj}_{cont}"
 
 
+def _task_dir_name(task: str) -> str:
+    """
+    Stable directory name for a task string.
+    Example: "place the cross into the mug_no_handle" -> "cross_into_mug_no_handle"
+    """
+    words = task.lower().split()
+    obj = next((w for w in words if w in OBJECT_NAMES), "obj")
+    cont = next((w for w in words if w in CONTAINER_NAMES), "cont")
+    name = f"{obj}_into_{cont}"
+    # sanitize
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch in ("_", "-"):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)
+
+
 def fix_env_task_pointers(env) -> None:
     """Update live object references after task / index changes."""
     env.object_A = env.object_A_list[env.object_A_index]
@@ -386,12 +405,13 @@ class SingleStageCGWrapper:
                 last_error = exc
         raise last_error if last_error is not None else RuntimeError("env.reset() failed without exception")
 
-    def reset(self, **kwargs):
+    def reset(self, *, tasks: list[str] | None = None, **kwargs):
         kwargs.pop("seed", None)
+        if tasks is not None and len(tasks) != self.num_envs:
+            raise ValueError(f"tasks must have length {self.num_envs}, got {len(tasks)}")
         self.obs = []
         for i, env in enumerate(self.envs):
-            task = str(np.random.choice(ALL_TASKS))
-            # task = "place the cross into the mug"
+            task = str(tasks[i]) if tasks is not None else str(np.random.choice(ALL_TASKS))
             self.tasks[i] = task
             self.obj_indices[i] = next(idx for idx, name in enumerate(OBJECT_NAMES) if name in task)
             self.cont_indices[i] = next(idx for idx, name in enumerate(CONTAINER_NAMES) if name in task)
@@ -1426,13 +1446,68 @@ def save_episode_to_hdf5(hdf5_path: Path, ep: dict, ep_id: int) -> None:
         grp.attrs["success"] = bool(ep.get("success", False))
 
 
+def _write_video_array(video: np.ndarray, path: Path, fps: int = 20) -> None:
+    """
+    Write an MP4 from a (T,H,W,3) uint8 array (one camera).
+    """
+    import imageio.v2 as iio  # type: ignore
+
+    v = np.asarray(video)
+    if v.ndim != 4 or v.shape[-1] != 3:
+        raise ValueError(f"video must be (T,H,W,3), got shape={v.shape}")
+    if v.dtype != np.uint8:
+        v = v.astype(np.uint8)
+
+    writer = iio.get_writer(
+        str(path),
+        fps=int(fps),
+        codec="libx264",
+        output_params=["-pix_fmt:v", "yuv420p", "-crf", "18"],
+    )
+    for t in range(v.shape[0]):
+        writer.append_data(v[t])
+    writer.close()
+
+
+def save_demo_triplet(demo_dir: Path, ep: dict, *, fps: int = 20) -> None:
+    """
+    Save one successful demo in the structured dataset format:
+      - demo.hdf5 (numeric + task string)
+      - agentview.mp4 (camera)
+      - robot0_eye_in_hand.mp4 (camera)
+    """
+    demo_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- numeric (HDF5) ---
+    h5_path = demo_dir / "demo.hdf5"
+    with h5py.File(h5_path, "w") as f:
+        obs_grp = f.require_group("obs")
+        obs_grp.create_dataset("robot0_eef_pos", data=ep["eef_pos"], compression="gzip")
+        obs_grp.create_dataset("robot0_eef_quat", data=ep["eef_quat"], compression="gzip")
+        obs_grp.create_dataset("robot0_gripper_qpos", data=ep["gripper_q"], compression="gzip")
+        obs_grp.create_dataset("object", data=ep["obj_world"], compression="gzip")
+        if "env_state" in ep:
+            obs_grp.create_dataset("environment_state", data=ep["env_state"], compression="gzip")
+        f.create_dataset("actions", data=ep["actions"], compression="gzip")
+        f.attrs["task"] = str(ep["task"])
+        f.attrs["planner"] = str(ep.get("planner", "simple_pick_place"))
+        f.attrs["success"] = bool(ep.get("success", False))
+
+    # --- images (MP4s, one per camera) ---
+    if "agentview" not in ep or "eye_in_hand" not in ep:
+        raise KeyError("episode missing required image streams: agentview and/or eye_in_hand")
+    _write_video_array(ep["agentview"], demo_dir / "agentview.mp4", fps=fps)
+    _write_video_array(ep["eye_in_hand"], demo_dir / "robot0_eye_in_hand.mp4", fps=fps)
+
+
 def run_batch(
     env: SingleStageCGWrapper,
     *,
     horizon: int,
     planner_params: PickPlaceParams | None = None,
+    tasks: list[str] | None = None,
 ) -> tuple[list[dict | None], dict]:
-    obs, _ = env.reset()
+    obs, _ = env.reset(tasks=tasks)
     planners = [
         SimplePickPlacePlanner(
             waypoint_params=planner_params,
@@ -1566,8 +1641,10 @@ def generate_dataset(
     env: SingleStageCGWrapper,
     *,
     n_success_episodes: int,
+    per_task_success: int = 0,
+    tasks_to_run: list[str] | None = None,
     horizon: int,
-    hdf5_path: Path,
+    demos_dir: Path,
     planner_params: PickPlaceParams | None = None,
     videos_dir: Path | None = None,
     max_videos: int = 0,
@@ -1576,82 +1653,161 @@ def generate_dataset(
 ) -> dict:
     if videos_dir is not None and max_videos > 0:
         videos_dir.mkdir(parents=True, exist_ok=True)
+    demos_dir.mkdir(parents=True, exist_ok=True)
 
     stats = GenStats()
     batch = 0
     start = time.time()
 
     log = (logger.info if logger is not None else print)
-    log(f"Target: {n_success_episodes} successful one-stage episodes")
-    log(f"HDF5 : {hdf5_path}")
+    tasks_list = list(tasks_to_run) if tasks_to_run is not None else list(ALL_TASKS)
+    if int(per_task_success) > 0:
+        target_total = int(per_task_success) * len(tasks_list)
+        log(f"Target: {int(per_task_success)} successes / task x {len(tasks_list)} tasks = {target_total} demos")
+    else:
+        target_total = int(n_success_episodes)
+        log(f"Target: {target_total} successful one-stage episodes")
+    log(f"Demos: {demos_dir}")
     if max_videos > 0 and videos_dir is not None:
         log(f"Videos: up to {max_videos} -> {videos_dir}")
 
-    while stats.saved < n_success_episodes:
-        batch += 1
-        log(f"[batch {batch}] start | saved={stats.saved}/{n_success_episodes}")
+    def _maybe_save_review_video(ep: dict, *, attempt_id: int) -> None:
+        if videos_dir is None or stats.videos >= max_videos:
+            return
+        if "agentview" not in ep or "eye_in_hand" not in ep:
+            return
+        tag = "success" if bool(ep.get("success", False)) else "fail"
+        name = f"ep{attempt_id:05d}_{_task_short(ep['task'])}_{tag}.mp4"
+        frames = _make_video_frames(ep["agentview"], ep["eye_in_hand"])
+        try:
+            _write_video(frames, videos_dir / name, fps=fps)
+            stats.videos += 1
+            log(f"  video -> {name}")
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(f"  video failed ({name}): {exc}")
 
-        episodes, batch_info = run_batch(env, horizon=horizon, planner_params=planner_params)
-        stats.attempted += int(batch_info["num_envs"])
-        base_attempt_id = stats.attempted - int(batch_info["num_envs"])
-        for task in env.tasks:
-            stats.task_attempts[str(task)] += 1
+    def _record_task_attempts() -> None:
+        for t in env.tasks:
+            stats.task_attempts[str(t)] += 1
 
-        for i, ep in enumerate(episodes):
-            if ep is None:
-                continue
+    def _record_task_success(ep: dict) -> None:
+        if bool(ep.get("success", False)):
+            stats.successful += 1
+            stats.task_successes[str(ep["task"])] += 1
 
-            if bool(ep.get("success", False)):
-                stats.successful += 1
-                stats.task_successes[str(ep["task"])] += 1
+    if int(per_task_success) > 0:
+        # Per-task mode: iterate tasks, and save K successes per task into subfolders.
+        for task in tasks_list:
+            task_dir = demos_dir / _task_dir_name(task)
+            task_dir.mkdir(parents=True, exist_ok=True)
+            saved_for_task = 0
 
-            if stats.saved >= n_success_episodes:
-                continue
+            log("-" * 60)
+            log(f"Task: {task} | dir={task_dir.name} | target={int(per_task_success)} demos")
+            log("-" * 60)
 
-            # Only save successful rollouts into HDF5
-            if bool(ep.get("success", False)):
-                save_episode_to_hdf5(hdf5_path, ep, stats.saved)
+            while saved_for_task < int(per_task_success):
+                batch += 1
+                log(f"[batch {batch}] {task_dir.name} | saved_task={saved_for_task}/{int(per_task_success)} | saved_all={stats.saved}/{target_total}")
 
-            # Save videos for both success and failure by default (bounded by max_videos)
-            if videos_dir is not None and stats.videos < max_videos and "agentview" in ep and "eye_in_hand" in ep:
-                tag = "success" if bool(ep.get("success", False)) else "fail"
+                episodes, batch_info = run_batch(
+                    env,
+                    horizon=horizon,
+                    planner_params=planner_params,
+                    tasks=[task] * int(env.num_envs),
+                )
+                stats.attempted += int(batch_info["num_envs"])
+                base_attempt_id = stats.attempted - int(batch_info["num_envs"])
+                _record_task_attempts()
+
+                for i, ep in enumerate(episodes):
+                    if ep is None:
+                        continue
+
+                    _record_task_success(ep)
+                    attempt_id = base_attempt_id + i + 1
+
+                    if bool(ep.get("success", False)) and saved_for_task < int(per_task_success):
+                        demo_dir = task_dir / f"demo_{saved_for_task:06d}"
+                        try:
+                            save_demo_triplet(demo_dir, ep, fps=fps)
+                            saved_for_task += 1
+                            stats.saved += 1
+                        except Exception as exc:
+                            if logger is not None:
+                                logger.warning(f"  demo save failed ({demo_dir}): {exc}")
+                            else:
+                                print(f"  demo save failed ({demo_dir}): {exc}")
+
+                    _maybe_save_review_video(ep, attempt_id=attempt_id)
+
+                    tag = "success" if bool(ep.get("success", False)) else "fail"
+                    log(f"  ep | {tag:7s} | {ep['task']} | T={len(ep['actions'])}")
+
+                batch_sr = (int(batch_info["batch_successes"]) / max(int(batch_info["num_envs"]), 1)) * 100.0
+                overall_sr = (stats.successful / max(stats.attempted, 1)) * 100.0
+                saved_rate = (stats.saved / max(stats.attempted, 1)) * 100.0
+                log(
+                    f"[batch {batch}] done | steps={batch_info['steps_taken']}/{horizon} | "
+                    f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
+                    f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
+                )
+    else:
+        # Total mode: save N successes across all tasks into demos_dir/.
+        while stats.saved < int(n_success_episodes):
+            batch += 1
+            log(f"[batch {batch}] start | saved={stats.saved}/{int(n_success_episodes)}")
+
+            episodes, batch_info = run_batch(env, horizon=horizon, planner_params=planner_params)
+            stats.attempted += int(batch_info["num_envs"])
+            base_attempt_id = stats.attempted - int(batch_info["num_envs"])
+            _record_task_attempts()
+
+            for i, ep in enumerate(episodes):
+                if ep is None:
+                    continue
+
+                _record_task_success(ep)
                 attempt_id = base_attempt_id + i + 1
-                name = f"ep{attempt_id:05d}_{_task_short(ep['task'])}_{tag}.mp4"
-                frames = _make_video_frames(ep["agentview"], ep["eye_in_hand"])
-                try:
-                    _write_video(frames, videos_dir / name, fps=fps)
-                    stats.videos += 1
-                    log(f"  video -> {name}")
-                except Exception as exc:
-                    if logger is not None:
-                        logger.warning(f"  video failed ({name}): {exc}")
 
-            # Print per-episode line; save counter increments only on success
-            tag = "success" if bool(ep.get("success", False)) else "fail"
-            log(f"  ep | {tag:7s} | {ep['task']} | T={len(ep['actions'])}")
-            if bool(ep.get("success", False)):
-                stats.saved += 1
+                if stats.saved < int(n_success_episodes) and bool(ep.get("success", False)):
+                    demo_dir = demos_dir / f"demo_{stats.saved:06d}"
+                    try:
+                        save_demo_triplet(demo_dir, ep, fps=fps)
+                        stats.saved += 1
+                    except Exception as exc:
+                        if logger is not None:
+                            logger.warning(f"  demo save failed ({demo_dir.name}): {exc}")
+                        else:
+                            print(f"  demo save failed ({demo_dir.name}): {exc}")
 
-        batch_sr = (int(batch_info["batch_successes"]) / max(int(batch_info["num_envs"]), 1)) * 100.0
-        overall_sr = (stats.successful / max(stats.attempted, 1)) * 100.0
-        saved_rate = (stats.saved / max(stats.attempted, 1)) * 100.0
-        log(
-            f"[batch {batch}] done | steps={batch_info['steps_taken']}/{horizon} | "
-            f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
-            f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
-        )
+                _maybe_save_review_video(ep, attempt_id=attempt_id)
+
+                tag = "success" if bool(ep.get("success", False)) else "fail"
+                log(f"  ep | {tag:7s} | {ep['task']} | T={len(ep['actions'])}")
+
+            batch_sr = (int(batch_info["batch_successes"]) / max(int(batch_info["num_envs"]), 1)) * 100.0
+            overall_sr = (stats.successful / max(stats.attempted, 1)) * 100.0
+            saved_rate = (stats.saved / max(stats.attempted, 1)) * 100.0
+            log(
+                f"[batch {batch}] done | steps={batch_info['steps_taken']}/{horizon} | "
+                f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
+                f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
+            )
 
     elapsed = time.time() - start
     return {
-        "n_target_success_episodes": int(n_success_episodes),
+        "n_target_success_episodes": int(target_total),
         "n_attempted_episodes": int(stats.attempted),
         "n_successful_episodes": int(stats.successful),
         "n_saved_episodes": int(stats.saved),
         "rollout_success_rate": stats.successful / max(stats.attempted, 1) * 100.0,
         "saved_success_rate": stats.saved / max(stats.attempted, 1) * 100.0,
         "elapsed_s": elapsed,
-        "hdf5_path": str(hdf5_path),
+        "demos_dir": str(demos_dir),
         "n_videos_saved": int(stats.videos),
+        "per_task_success": int(per_task_success),
         "per_task": {
             task: {
                 "attempted": int(stats.task_attempts[task]),
@@ -1669,6 +1825,12 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--n-success", type=int, default=200, help="Successful episodes to collect")
+    parser.add_argument(
+        "--per-task-success",
+        type=int,
+        default=0,
+        help="If >0, run all 16 tasks and save this many successful demos per task.",
+    )
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel environments")
     parser.add_argument("--horizon", type=int, default=220, help="Max steps per episode")
     parser.add_argument("--out-dir", default="results/cg_l4_motion_gen")
@@ -1700,7 +1862,8 @@ def main():
     run_id = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out_dir) / f"gen_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    hdf5_path = out_dir / "demos.hdf5"
+    demos_dir = out_dir / ("task" if int(args.per_task_success) > 0 else "demos")
+    demos_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = (out_dir / "videos") if args.max_videos > 0 else None
 
     logger = _setup_logger(out_dir, args.log_level)
@@ -1709,16 +1872,12 @@ def main():
     info = generate_dataset(
         env,
         n_success_episodes=args.n_success,
+        per_task_success=int(args.per_task_success),
         horizon=args.horizon,
-        hdf5_path=hdf5_path,
+        demos_dir=demos_dir,
         planner_params=PickPlaceParams(
             use_orientation_control=bool(args.use_orientation_control),
             rotate_for_grasp_enable=not bool(args.no_rotate_for_grasp),
-            stage_offset_rules=[
-                StageOffsetRule(stage="place", container="mug", delta_xyz=(0.00, 0.00, 0.05)),
-                StageOffsetRule(stage="place", container="mug_no_handle", delta_xyz=(0.00, 0.00, 0.05)),
-                StageOffsetRule(stage="place", container="bin", delta_xyz=(0.00, 0.00, 0.02)),
-            ],
         ),
         videos_dir=videos_dir,
         max_videos=args.max_videos,
@@ -1740,7 +1899,7 @@ def main():
         "rollout_success_rate",
         "saved_success_rate",
         "elapsed_s",
-        "hdf5_path",
+        "demos_dir",
         "n_videos_saved",
     ]:
         logger.info(f"{k}: {info[k]}")
