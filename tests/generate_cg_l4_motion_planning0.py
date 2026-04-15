@@ -60,11 +60,6 @@ from robosuite.controllers import load_composite_controller_config
 from robosuite.utils.errors import RandomizationError
 from robosuite.utils.placement_samplers import UniformApartRandomSampler
 
-# Reuse the simple controller implementation from our test script.
-# This keeps "controller math" in one place and lets generation stay minimal.
-from test_motion_planner import ControllerParams as SimpleControllerParams
-from test_motion_planner import SimplePoseController as SimplePoseController
-
 
 OBJECT_NAMES = ["cross", "cube", "cylinder", "milk"]
 CONTAINER_NAMES = ["bin", "mug", "plate", "mug_no_handle"]
@@ -290,7 +285,7 @@ def make_env(*, horizon: int):
     controller_config = load_composite_controller_config(controller="BASIC", robot="Panda")
     bootstrap_sampler_a = UniformApartRandomSampler(
         name="FullDesk_Object_A_Sampler",
-        x_range=[-0.18, 0.20],
+        x_range=[-0.26, 0.26],
         y_range=[-0.28, -0.05],
         rotation=None,
         ensure_object_boundary_in_range=False,
@@ -301,7 +296,7 @@ def make_env(*, horizon: int):
     )
     bootstrap_sampler_b = UniformApartRandomSampler(
         name="FullDesk_Object_B_Sampler",
-        x_range=[-0.18, 0.20],
+        x_range=[-0.26, 0.26],
         y_range=[0.05, 0.28],
         rotation=None,
         ensure_object_boundary_in_range=False,
@@ -510,23 +505,6 @@ class PickPlaceParams:
     path_speed_m_per_step: float = 0.009 
     path_u_max_step: float = 0.82
     path_end_pos_tol_m: float = 0.022
-    # --- Pose noise for diversity (meters) ---
-    # Noise is applied in world frame as independent Gaussian noise:
-    #   dx,dy ~ N(0, noise_xy_*), dz ~ N(0, noise_z_*)
-    # Recommended: z std > xy std.
-    pose_noise_enable: bool = True
-    # Pregrasp: larger noise
-    noise_pregrasp_xy: float = 0.010
-    noise_pregrasp_z: float = 0.020
-    # Grasp: smaller noise (more precise)
-    noise_grasp_xy: float = 0.003
-    noise_grasp_z: float = 0.001
-    # Preplace: larger noise (approach)
-    noise_preplace_xy: float = 0.012
-    noise_preplace_z: float = 0.01
-    # Place: smaller noise (precision at release)
-    noise_place_xy: float = 0.004
-    noise_place_z: float = 0.001
 
 
 @dataclass(frozen=True)
@@ -590,60 +568,17 @@ def generate_grasp_release_poses(
     """
     obj_half = float(env.object_A.top_offset[-1])
 
-    def _sample_delta(*, xy_std: float, z_std: float) -> np.ndarray:
-        dxy = np.random.normal(loc=0.0, scale=float(xy_std), size=(2,)).astype(np.float32)
-        dz = np.random.normal(loc=0.0, scale=float(z_std), size=(1,)).astype(np.float32)
-        return np.array([dxy[0], dxy[1], dz[0]], dtype=np.float32)
+    pregrasp = targets.object_pose.pos.copy()
+    pregrasp[2] += float(params.pregrasp_h)
 
-    def _extra_std(large: float, small: float) -> float:
-        # if we want pre* to be "larger noise" but correlated with the smaller-noise pose
-        return float(np.sqrt(max(float(large) ** 2 - float(small) ** 2, 0.0)))
+    grasp = targets.object_pose.pos.copy()
+    grasp[2] += float(np.clip(0.08 * obj_half, 0.001, 0.002))
 
-    pregrasp0 = targets.object_pose.pos.copy().astype(np.float32)
-    pregrasp0[2] += float(params.pregrasp_h)
+    place = targets.container_pose.pos.copy()
+    place[2] += float(_container_place_z_offset(env, obj_half_h=obj_half))
 
-    grasp0 = targets.object_pose.pos.copy().astype(np.float32)
-    grasp0[2] += float(np.clip(0.08 * obj_half, 0.001, 0.002))
-
-    place0 = targets.container_pose.pos.copy().astype(np.float32)
-    place0[2] += float(_container_place_z_offset(env, obj_half_h=obj_half))
-
-    preplace0 = place0.copy()
-    preplace0[2] += float(params.preplace_h)
-
-    # Apply stage-dependent noise (z larger than xy).
-    if bool(params.pose_noise_enable):
-        d_place = _sample_delta(xy_std=params.noise_place_xy, z_std=params.noise_place_z)
-        d_preplace = _sample_delta(
-            xy_std=_extra_std(params.noise_preplace_xy, params.noise_place_xy),
-            z_std=_extra_std(params.noise_preplace_z, params.noise_place_z),
-        )
-        d_preplace[2] = abs(d_preplace[2])
-        d_preplace += d_place
-
-        d_grasp = _sample_delta(xy_std=params.noise_grasp_xy, z_std=params.noise_grasp_z)
-        d_pregrasp = _sample_delta(
-            xy_std=_extra_std(params.noise_pregrasp_xy, params.noise_grasp_xy),
-            z_std=_extra_std(params.noise_pregrasp_z, params.noise_grasp_z),
-        )
-        d_pregrasp[2] = abs(d_pregrasp[2])
-        d_pregrasp += d_grasp
-
-        place = place0 + d_place
-        preplace = preplace0 + d_preplace
-        grasp = grasp0 + d_grasp
-        pregrasp = pregrasp0 + d_pregrasp
-    else:
-        place = place0
-        preplace = preplace0
-        grasp = grasp0
-        pregrasp = pregrasp0
-
-    # Safety: keep all Z above the table.
-    table_z = float(env.model.mujoco_arena.table_offset[2])
-    z_floor = table_z + 0.01
-    for p in (pregrasp, grasp, preplace, place):
-        p[2] = max(float(p[2]), z_floor)
+    preplace = place.copy()
+    preplace[2] += float(params.preplace_h)
 
     q = (eef_quat_xyzw.copy() if eef_quat_xyzw is not None else None)
     return GraspReleasePoses(
@@ -1000,278 +935,6 @@ class WaypointPickPlacePlanner:
         return a
 
 
-@dataclass(frozen=True)
-class SimpleWaypoint:
-    pos: np.ndarray
-    quat_xyzw: np.ndarray | None
-    gripper_move: float
-    gripper_hold: float
-    name: str
-    repeat: int = 1
-
-
-class PickPlaceWaypointGenerator:
-    """
-    Single-responsibility: compute a minimal waypoint list.
-    Current stage: pregrasp -> grasp -> prerelease -> release -> lift.
-    """
-
-    def __init__(self, *, params: PickPlaceParams | None = None, grasp_hold_steps: int = 18, release_hold_steps: int = 22):
-        self.params = params or PickPlaceParams()
-        self.grasp_hold_steps = int(grasp_hold_steps)
-        self.release_hold_steps = int(release_hold_steps)
-
-    def generate(self, env, *, eef_quat_xyzw: np.ndarray) -> list[SimpleWaypoint]:
-        def _scene_clearance_z(*, margin: float = 0.10, min_above_table: float = 0.18) -> float:
-            """
-            Compute a conservative Z height above all objects / containers.
-
-            We scan known CG_L4 body ids when present (cross/cube/cylinder/milk/bin/mug/plate/mug_no_handle).
-            """
-            table_z = float(env.model.mujoco_arena.table_offset[2])
-            z_vals: list[float] = []
-            for attr in (
-                "cross_body_id",
-                "cube_body_id",
-                "cylinder_body_id",
-                "milk_body_id",
-                "bin_body_id",
-                "mug_body_id",
-                "plate_body_id",
-                "mug_no_handle_body_id",
-                "object_A_body_id",
-                "object_B_body_id",
-            ):
-                bid = getattr(env, attr, None)
-                if bid is None:
-                    continue
-                try:
-                    z_vals.append(float(env.sim.data.body_xpos[int(bid)][2]))
-                except Exception:
-                    continue
-            z_max = max(z_vals) if z_vals else table_z
-            return max(z_max + float(margin), table_z + float(min_above_table))
-
-        targets = get_target_poses(env)
-        # Do not align / control orientation for this simplified generator (translation-only).
-        q = canonicalize_quaternion(np.asarray(eef_quat_xyzw, dtype=np.float32))
-        gr = generate_grasp_release_poses(env, targets, eef_quat_xyzw=q, params=self.params)
-
-        # After grasp: lift straight up to clear all objects / containers to avoid collisions.
-        post_grasp_lift = gr.grasp.pos.astype(np.float32).copy()
-        post_grasp_lift[2] = float(_scene_clearance_z())
-
-        prerelease = gr.preplace.pos.astype(np.float32)  # higher than release; same (x,y)
-        release = gr.place.pos.astype(np.float32)
-
-        # Lift after release so CG_L4 lift_check can pass (and to clear rims).
-        table_z = float(env.model.mujoco_arena.table_offset[2])
-        lift = release.copy()
-        lift[2] = max(float(lift[2] + 0.12), table_z + 0.22)
-        lift[1] = float(lift[1] + 0.04)
-
-        quat_xyzw = None
-
-        return [
-            SimpleWaypoint(
-                pos=gr.pregrasp.pos.astype(np.float32),
-                quat_xyzw=quat_xyzw,
-                gripper_move=-1.0,
-                gripper_hold=-1.0,
-                name="pregrasp",
-            ),
-            SimpleWaypoint(
-                pos=gr.grasp.pos.astype(np.float32),
-                quat_xyzw=quat_xyzw,
-                # Only close after reaching grasp.
-                gripper_move=-1.0,
-                gripper_hold=1.0,
-                name="grasp",
-                repeat=max(1, self.grasp_hold_steps),
-            ),
-            # Collision-avoid lift: go up before translating toward container.
-            SimpleWaypoint(
-                pos=post_grasp_lift,
-                quat_xyzw=quat_xyzw,
-                gripper_move=1.0,
-                gripper_hold=1.0,
-                name="post_grasp_lift",
-            ),
-            SimpleWaypoint(
-                pos=prerelease,
-                quat_xyzw=quat_xyzw,
-                gripper_move=1.0,
-                gripper_hold=1.0,
-                name="prerelease",
-            ),
-            SimpleWaypoint(
-                pos=release,
-                quat_xyzw=quat_xyzw,
-                # Only open after reaching release.
-                gripper_move=1.0,
-                gripper_hold=-1.0,
-                name="release",
-                repeat=max(1, self.release_hold_steps),
-            ),
-            SimpleWaypoint(
-                pos=lift.astype(np.float32),
-                quat_xyzw=quat_xyzw,
-                gripper_move=-1.0,
-                gripper_hold=-1.0,
-                name="lift",
-            ),
-        ]
-
-
-class WaypointSequencer:
-    """
-    Single-responsibility: hold the active waypoint and advance when reached.
-    """
-
-    def __init__(self, *, pos_tol: float):
-        self.pos_tol = float(pos_tol)
-        self._wps: list[SimpleWaypoint] = []
-        self._idx: int = 0
-        self._holding: bool = False
-        self._dwell_remaining: int = 0
-        self.done: bool = False
-
-    def reset(self, waypoints: list[SimpleWaypoint]) -> None:
-        self._wps = list(waypoints)
-        self._idx = 0
-        self._holding = False
-        self._dwell_remaining = 0
-        # "done" means we've reached the end of a *non-empty* sequence.
-        # An empty list is treated as "uninitialized" so the planner can populate it lazily.
-        self.done = False
-
-    def is_empty(self) -> bool:
-        return len(self._wps) == 0
-
-    def current(self) -> SimpleWaypoint | None:
-        if self.done or self._idx >= len(self._wps):
-            return None
-        return self._wps[self._idx]
-
-    def is_holding(self) -> bool:
-        return bool(self._holding) and (self._dwell_remaining > 0)
-
-    def advance(self, *, reached: bool) -> None:
-        if self.done:
-            return
-        cur = self.current()
-        if cur is None:
-            self.done = True
-            return
-        if self._holding:
-            self._dwell_remaining -= 1
-            if self._dwell_remaining <= 0:
-                self._holding = False
-                self._idx += 1
-                if self._idx >= len(self._wps):
-                    self.done = True
-            return
-
-        if not bool(reached):
-            return
-
-        if int(cur.repeat) > 1:
-            self._holding = True
-            self._dwell_remaining = int(cur.repeat)
-            return
-
-        self._idx += 1
-        if self._idx >= len(self._wps):
-            self.done = True
-
-
-class SimplePickPlacePlanner:
-    """
-    Minimal pipeline:
-      - waypoint generator (pregrasp only)
-      - waypoint sequencer (advance on tolerance)
-      - controller (SimplePoseController)
-    """
-
-    def __init__(
-        self,
-        *,
-        waypoint_params: PickPlaceParams | None = None,
-        max_step_size: float = 0.02,
-        pos_tol: float = 0.01,
-        osc_pos_limit: float = 0.05,
-        grasp_hold_steps: int = 20,
-        release_hold_steps: int = 22,
-    ):
-        self.generator = PickPlaceWaypointGenerator(
-            params=waypoint_params,
-            grasp_hold_steps=grasp_hold_steps,
-            release_hold_steps=release_hold_steps,
-        )
-        self.seq = WaypointSequencer(pos_tol=pos_tol)
-        self.ctrl = SimplePoseController(
-            SimpleControllerParams(
-                max_step_size=float(max_step_size),
-                pos_tolerance=float(pos_tol),
-                osc_pos_limit=float(osc_pos_limit),
-                use_orientation=False,
-                rot_tolerance_rad=0.0,
-                osc_rot_limit_rad=0.5,
-                max_rot_step_rad=0.0,
-                ignore_position=False,
-            )
-        )
-        self.phase: str = "init"
-        self.done: bool = False
-        self.pregrasp_pos: np.ndarray | None = None
-        self.last_eef_pos: np.ndarray | None = None
-        self.last_waypoint: str | None = None
-
-    def reset(self) -> None:
-        self.phase = "init"
-        self.done = False
-        self.pregrasp_pos = None
-        self.last_eef_pos = None
-        self.last_waypoint = None
-        self.seq.reset([])
-
-    def get_action(self, env, *, eef_quat_xyzw: np.ndarray) -> np.ndarray:
-        self.last_eef_pos = _eef_site_pos(env).copy()
-        if self.done:
-            return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
-
-        if self.seq.is_empty():
-            wps = self.generator.generate(env, eef_quat_xyzw=eef_quat_xyzw)
-            self.seq.reset(wps)
-            if wps:
-                self.pregrasp_pos = wps[0].pos.copy()
-
-        cur = self.seq.current()
-        if cur is None:
-            self.done = True
-            self.phase = "done"
-            self.last_waypoint = "done"
-            return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
-
-        self.phase = cur.name
-        act, _pos_dist, _rot_dist, _err = self.ctrl.compute_action(env, target_pos=cur.pos, target_quat_xyzw=cur.quat_xyzw)
-        act = act.astype(np.float32)
-        eef = _eef_site_pos(env)
-        reached = float(np.linalg.norm(cur.pos - eef)) <= float(self.seq.pos_tol)
-        # While moving: gripper_move. When holding (dwell) at waypoint: gripper_hold.
-        if self.seq.is_holding() or (reached and int(cur.repeat) > 2):
-            act[6] = float(cur.gripper_hold)
-        else:
-            act[6] = float(cur.gripper_move)
-
-        self.seq.advance(reached=reached)
-        if self.seq.done:
-            self.done = True
-            self.phase = "done"
-            self.last_waypoint = cur.name
-        return act
-
-
 def save_episode_to_hdf5(hdf5_path: Path, ep: dict, ep_id: int) -> None:
     with h5py.File(hdf5_path, "a") as f:
         grp = f.require_group(f"demo_{ep_id}")
@@ -1301,8 +964,8 @@ def save_episode_to_hdf5(hdf5_path: Path, ep: dict, ep_id: int) -> None:
 
         grp.create_dataset("actions", data=ep["actions"], compression="gzip")
         grp.attrs["task"] = str(ep["task"])
-        grp.attrs["planner"] = str(ep.get("planner", "pregrasp_simple"))
-        grp.attrs["success"] = bool(ep.get("success", False))
+        grp.attrs["planner"] = "waypoint_pick_place"
+        grp.attrs["success"] = True
 
 
 def run_batch(
@@ -1312,15 +975,7 @@ def run_batch(
     planner_params: PickPlaceParams | None = None,
 ) -> tuple[list[dict | None], dict]:
     obs, _ = env.reset()
-    planners = [
-        SimplePickPlacePlanner(
-            waypoint_params=planner_params,
-            max_step_size=0.05,
-            pos_tol=0.005,
-            osc_pos_limit=_OSC_POS_MAX_M,
-        )
-        for _ in range(env.num_envs)
-    ]
+    planners = [WaypointPickPlacePlanner(params=planner_params) for _ in range(env.num_envs)]
     for planner in planners:
         planner.reset()
 
@@ -1372,24 +1027,14 @@ def run_batch(
         for i in range(env.num_envs):
             if done[i]:
                 continue
-            # Full task success is provided by the environment.
-            if bool(info["is_success"][i]):
+            # Match environment success only (sticky via SingleStageCGWrapper.is_success). Do not also require
+            # planner phase / grasp release — the env can report success before retreat, or while fingers still
+            # touch the object in the container, which would wrongly mark good demos as failure.
+            if info["is_success"][i]:
                 ep_success[i] = True
                 done[i] = True
             elif bool(terminated[i]) or bool(truncated[i]):
                 done[i] = True
-            if done[i]:
-                # Print pregrasp target vs final EEF for debugging (even for full task).
-                tgt = getattr(planners[i], "pregrasp_pos", None)
-                cur = getattr(planners[i], "last_eef_pos", None)
-                last_wp = getattr(planners[i], "last_waypoint", None)
-                if tgt is not None and cur is not None:
-                    dist = float(np.linalg.norm(np.asarray(tgt) - np.asarray(cur)))
-                    tag = "success" if ep_success[i] else "done"
-                    print(
-                        f"[env {i}] {tag} | last_wp={last_wp} | "
-                        f"pregrasp_target={np.array(tgt)} | final_eef={np.array(cur)} | dist_to_pregrasp={dist:.4f} m"
-                    )
 
     batch_successes = int(sum(ep_success))
 
@@ -1409,15 +1054,7 @@ def run_batch(
             "actions": np.stack(buf_actions[i]),
             "task": env.tasks[i],
             "success": bool(ep_success[i]),
-            "planner": "simple_pick_place",
         }
-        # Add debug scalars (not used by training; useful for checking convergence).
-        tgt = getattr(planners[i], "pregrasp_pos", None)
-        cur = getattr(planners[i], "last_eef_pos", None)
-        if tgt is not None and cur is not None:
-            ep["pregrasp_target_pos"] = np.asarray(tgt, dtype=np.float32)
-            ep["final_eef_pos"] = np.asarray(cur, dtype=np.float32)
-            ep["final_eef_dist_to_pregrasp"] = float(np.linalg.norm(ep["pregrasp_target_pos"] - ep["final_eef_pos"]))
         if buf_agentview[i]:
             ep["agentview"] = np.stack(buf_agentview[i][:T])
         if buf_eye[i]:

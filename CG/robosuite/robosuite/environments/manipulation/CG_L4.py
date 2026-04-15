@@ -606,6 +606,7 @@ class CG_L2(ManipulationEnv):
         self.object_B_list = [self.bin, self.mug, self.plate, self.mug_no_handle]
         self.objects = [self.cross, self.cube, self.cylinder, self.milk, self.bin, self.mug, self.plate, self.mug_no_handle]
 
+
         # Create placement initializer
         if self.placement_initializer_A is not None:
             self.placement_initializer_A.reset()
@@ -614,7 +615,7 @@ class CG_L2(ManipulationEnv):
             self.placement_initializer_A = UniformApartRandomSampler(
                 name="Object_A_Sampler",
                 mujoco_objects=self.object_A_list,
-                x_range=[-0.15, 0.15],
+                x_range=[-0.05, 0.15],
                 y_range=[-0.25, -0.05],
                 rotation=None,
                 ensure_object_boundary_in_range=False,
@@ -630,7 +631,7 @@ class CG_L2(ManipulationEnv):
             self.placement_initializer_B = UniformApartRandomSampler(
                 name="Object_B_Sampler",
                 mujoco_objects=self.object_B_list,
-                x_range=[-0.15, 0.15],
+                x_range=[-0.05, 0.15],
                 y_range=[0.05, 0.25],
                 rotation=None,
                 ensure_object_boundary_in_range=False,

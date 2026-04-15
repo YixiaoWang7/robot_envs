@@ -78,3 +78,10 @@ python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --hor
 
 
 python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --horizon 350 --max-videos 40 --out-dir results/cg_l4_motion_real_smoke --use-orientation-control 
+
+
+python tests/generate_cg_l4_motion_planning.py --n-success 1 --num-envs 1 --horizon 200 --out-dir results/test --max-videos 1
+
+
+
+python tests/generate_cg_l4_motion_planning.py --n-success 40 --num-envs 1 --horizon 500 --out-dir results/test --max-videos 40
