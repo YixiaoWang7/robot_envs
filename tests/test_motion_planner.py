@@ -119,7 +119,6 @@ def make_env(*, horizon: int, task: str, record_video: bool, video_size: int):
         robots="Panda",
         controller_configs=controller_config,
         gripper_types="PandaGripper",
-        strategy="fixed",
         task=task,
         horizon=horizon,
         hard_reset=False,
@@ -294,16 +293,29 @@ class ControllerParams:
     osc_rot_limit_rad: float = 0.50
     max_rot_step_rad: float = 0.15
     ignore_position: bool = False
+    # Acceleration limiting: max change in action per step (normalized action space).
+    # The raw action from position error is treated as "target velocity",
+    # and we accelerate/decelerate toward it smoothly. Set to 0 to disable.
+    max_acceleration: float = 0.0
+    # When close to target, apply early deceleration to stop smoothly.
+    # If enabled, we compute stopping distance and start decelerating early.
+    use_smooth_stop: bool = True
 
 
 class SimplePoseController:
     """
     Translation-only controller:
     move straight toward the target, but cap the commanded delta magnitude.
+    With acceleration limiting for smooth start/stop.
     """
 
     def __init__(self, params: ControllerParams):
         self.params = params
+        self._current_velocity: np.ndarray | None = None  # Current action velocity (6-dim: pos+rot)
+
+    def reset(self) -> None:
+        """Reset internal state (e.g., when starting a new episode)."""
+        self._current_velocity = None
 
     def compute_action(
         self,
@@ -344,15 +356,56 @@ class SimplePoseController:
                 commanded_world = error_world
 
         commanded_base = robot_base_rotmat(env).T @ commanded_world
-        action[:3] = np.clip(commanded_base / self.params.osc_pos_limit, -1.0, 1.0)
+        target_action = np.zeros(7, dtype=np.float32)
+        target_action[:3] = np.clip(commanded_base / self.params.osc_pos_limit, -1.0, 1.0)
         if self.params.use_orientation and (target_quat_xyzw is not None):
             # Take a bounded step in rotation-vector space to match delta-controller semantics.
             rv = rotvec_b.astype(np.float32)
             rv_norm = float(np.linalg.norm(rv))
             if rv_norm > float(self.params.max_rot_step_rad):
                 rv = rv * (float(self.params.max_rot_step_rad) / max(rv_norm, 1e-8))
-            action[3:6] = np.clip(rv / self.params.osc_rot_limit_rad, -1.0, 1.0)
+            target_action[3:6] = np.clip(rv / self.params.osc_rot_limit_rad, -1.0, 1.0)
 
+        # Acceleration limiting: treat target_action as desired velocity,
+        # accelerate/decelerate toward it with max_acceleration.
+        if self.params.max_acceleration > 0.0:
+            if self._current_velocity is None:
+                self._current_velocity = np.zeros(6, dtype=np.float32)
+            
+            target_vel = target_action[:6]
+            
+            # Smooth stop: when approaching target, compute stopping distance and decelerate early.
+            if self.params.use_smooth_stop:
+                # Estimate how many steps needed to stop from current velocity.
+                current_speed = float(np.linalg.norm(self._current_velocity[:3]))
+                if current_speed > 1e-6:
+                    # Stopping distance: v^2 / (2*a), in action space
+                    stopping_steps = current_speed / (2.0 * self.params.max_acceleration)
+                    # Distance to target in normalized action space (approx).
+                    # pos_dist is in meters, we normalize by osc_pos_limit to get action-space distance.
+                    action_space_dist = pos_dist / self.params.osc_pos_limit
+                    
+                    # If we're within stopping distance, reduce target velocity proportionally.
+                    if action_space_dist < stopping_steps * current_speed:
+                        # Deceleration phase: scale down target velocity.
+                        scale = max(0.0, action_space_dist / max(stopping_steps * current_speed, 1e-8))
+                        target_vel[:3] = target_vel[:3] * scale
+            
+            # Apply acceleration limit: clamp velocity change per step.
+            delta_v = target_vel - self._current_velocity
+            delta_v_norm = float(np.linalg.norm(delta_v))
+            if delta_v_norm > self.params.max_acceleration:
+                delta_v = delta_v * (self.params.max_acceleration / max(delta_v_norm, 1e-8))
+            
+            self._current_velocity = self._current_velocity + delta_v
+            action[:6] = self._current_velocity.copy()
+        else:
+            # No acceleration limiting: use target action directly.
+            action[:6] = target_action[:6]
+            if self._current_velocity is not None:
+                self._current_velocity = action[:6].copy()
+        
+        action[6] = target_action[6]  # Gripper command (no smoothing)
         return action, pos_dist, rot_dist, error_world
 
 

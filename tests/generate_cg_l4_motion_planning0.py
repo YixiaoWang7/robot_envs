@@ -309,7 +309,6 @@ def make_env(*, horizon: int):
         robots="Panda",
         controller_configs=controller_config,
         gripper_types="PandaGripper",
-        strategy="fixed",
         task="place the cross into the bin",  # overridden on every reset
         horizon=horizon,
         hard_reset=False,

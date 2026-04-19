@@ -355,7 +355,6 @@ def make_env(*, horizon: int):
         robots="Panda",
         controller_configs=controller_config,
         gripper_types="PandaGripper",
-        strategy="fixed",
         task="place the cross into the bin",  # overridden on every reset
         horizon=horizon,
         hard_reset=False,
@@ -432,15 +431,13 @@ class SingleStageCGWrapper:
     def step(self, actions: np.ndarray):
         next_obs, rewards, terminateds, truncateds, infos = [], [], [], [], []
         for i, env in enumerate(self.envs):
-            if self.is_success[i]:
-                obs_i, reward, terminated, info = env.step(np.zeros_like(actions[i]))
-            else:
-                obs_i, reward, terminated, info = env.step(actions[i].copy())
+            obs_i, reward, terminated, info = env.step(actions[i].copy())
 
             self.obs[i] = obs_i
-            info["is_success"] = bool(env._check_success())
-            if not self.is_success[i]:
-                self.is_success[i] = info["is_success"]
+            cur_success = bool(env._check_success())
+            # Sticky success: once success is achieved, keep it True for the rest of the episode.
+            self.is_success[i] = bool(self.is_success[i] or cur_success)
+            info["is_success"] = bool(self.is_success[i])
 
             next_obs.append(self._compute_observation(i))
             rewards.append(reward)
@@ -566,7 +563,7 @@ class PickPlaceParams:
     # tolerance for object<->container XY alignment (meters)
     xy_tol: float = 0.006
     # smooth trajectory discretization (meters per waypoint segment)
-    step_size: float = 0.060
+    step_size: float = 0.020
     # minimum number of points per segment (including endpoint samples)
     min_segment_points: int = 3
     # Mug only: lift this much (m) along Z after lowering, before opening — clears the rim / avoids scraping.
@@ -668,7 +665,7 @@ def generate_grasp_release_poses(
     pregrasp0[2] += float(params.pregrasp_h)
 
     grasp0 = targets.object_pose.pos.copy().astype(np.float32)
-    grasp0[2] += float(np.clip(0.08 * obj_half, 0.001, 0.002))
+    # grasp0[2] += float(np.clip(0.08 * obj_half, 0.001, 0.002))
 
     place0 = targets.container_pose.pos.copy().astype(np.float32)
     place0[2] += float(_container_place_z_offset(env, obj_half_h=obj_half))
@@ -769,8 +766,8 @@ def quat_slerp(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray, t: float) -> np.ndarray
 
 
 # Matches default composite BASIC + OSC_POSE for Panda (see robosuite basic.json).
-_OSC_POS_MAX_M = 0.05
-_OSC_ROT_MAX_RAD = 0.5
+_OSC_POS_MAX_M = 0.03
+_OSC_ROT_MAX_RAD = 0.3
 
 
 def _robot_base_rotmat(env) -> np.ndarray:
@@ -1317,6 +1314,8 @@ class SimplePickPlacePlanner:
         osc_pos_limit: float = 0.05,
         grasp_hold_steps: int = 20,
         release_hold_steps: int = 22,
+        max_acceleration: float = 0.0,
+        use_smooth_stop: bool = True,
     ):
         self.generator = PickPlaceWaypointGenerator(
             params=waypoint_params,
@@ -1335,6 +1334,8 @@ class SimplePickPlacePlanner:
                 osc_rot_limit_rad=0.5,
                 max_rot_step_rad=0.08,
                 ignore_position=False,
+                max_acceleration=float(max_acceleration),
+                use_smooth_stop=bool(use_smooth_stop),
             )
         )
         self.phase: str = "init"
@@ -1352,6 +1353,7 @@ class SimplePickPlacePlanner:
         self.last_waypoint = None
         self._cached_yaw_target_quat_xyzw = None
         self.seq.reset([])
+        self.ctrl.reset()
 
     def get_action(self, env, *, eef_quat_xyzw: np.ndarray) -> np.ndarray:
         self.last_eef_pos = _eef_site_pos(env).copy()
@@ -1506,6 +1508,8 @@ def run_batch(
     horizon: int,
     planner_params: PickPlaceParams | None = None,
     tasks: list[str] | None = None,
+    fps: int = 20,
+    post_success_hold_s: float = 0.5,
 ) -> tuple[list[dict | None], dict]:
     obs, _ = env.reset(tasks=tasks)
     planners = [
@@ -1514,6 +1518,10 @@ def run_batch(
             max_step_size=0.05,
             pos_tol=0.005,
             osc_pos_limit=_OSC_POS_MAX_M,
+            grasp_hold_steps=25,
+            release_hold_steps=25,
+            max_acceleration=0.15,
+            use_smooth_stop=True,
         )
         for _ in range(env.num_envs)
     ]
@@ -1522,6 +1530,9 @@ def run_batch(
 
     done = [False] * env.num_envs
     ep_success = [False] * env.num_envs
+    # After the planner finishes (lift completed), hold still for a short time before stopping.
+    hold_remaining = [0] * env.num_envs
+    hold_steps = max(0, int(round(float(post_success_hold_s) * float(max(int(fps), 1)))))
 
     buf_eef_pos = [[] for _ in range(env.num_envs)]
     buf_eef_quat = [[] for _ in range(env.num_envs)]
@@ -1557,6 +1568,18 @@ def run_batch(
             if done[i]:
                 continue
             eef_quat_xyzw = obs["observation.state"][i][3:7].astype(np.float32)
+            # If we already saw success and the planner finished its final lift, hold still for a bit
+            # (this extends the recorded demo to include "lift + settle").
+            if bool(ep_success[i]) and bool(planners[i].done):
+                if hold_remaining[i] <= 0:
+                    hold_remaining[i] = int(hold_steps)
+                if hold_remaining[i] > 0:
+                    action_mat[i] = np.array([0, 0, 0, 0, 0, 0, -1.0], dtype=np.float32)
+                    hold_remaining[i] -= 1
+                    if hold_remaining[i] <= 0:
+                        done[i] = True
+                        continue
+
             action_mat[i] = planners[i].get_action(env.envs[i], eef_quat_xyzw=eef_quat_xyzw)
             buf_actions[i].append(action_mat[i].copy())
 
@@ -1571,7 +1594,7 @@ def run_batch(
             # Full task success is provided by the environment.
             if bool(info["is_success"][i]):
                 ep_success[i] = True
-                done[i] = True
+                # Do not stop immediately: keep running until planner completes lift + post-success hold.
             elif bool(terminated[i]) or bool(truncated[i]):
                 done[i] = True
             if done[i]:
@@ -1716,6 +1739,7 @@ def generate_dataset(
                     horizon=horizon,
                     planner_params=planner_params,
                     tasks=[task] * int(env.num_envs),
+                    fps=fps,
                 )
                 stats.attempted += int(batch_info["num_envs"])
                 base_attempt_id = stats.attempted - int(batch_info["num_envs"])
@@ -1759,7 +1783,21 @@ def generate_dataset(
             batch += 1
             log(f"[batch {batch}] start | saved={stats.saved}/{int(n_success_episodes)}")
 
-            episodes, batch_info = run_batch(env, horizon=horizon, planner_params=planner_params)
+            # If a task subset is provided, sample tasks from it (or keep fixed for a single-task run).
+            tasks = None
+            if tasks_to_run is not None:
+                if len(tasks_list) == 1:
+                    tasks = [tasks_list[0]] * int(env.num_envs)
+                else:
+                    tasks = [str(np.random.choice(tasks_list)) for _ in range(int(env.num_envs))]
+
+            episodes, batch_info = run_batch(
+                env,
+                horizon=horizon,
+                planner_params=planner_params,
+                tasks=tasks,
+                fps=fps,
+            )
             stats.attempted += int(batch_info["num_envs"])
             base_attempt_id = stats.attempted - int(batch_info["num_envs"])
             _record_task_attempts()
@@ -1829,7 +1867,13 @@ def main():
         "--per-task-success",
         type=int,
         default=0,
-        help="If >0, run all 16 tasks and save this many successful demos per task.",
+        help="If >0, run tasks and save this many successful demos per task. Use --task to restrict to one task.",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="",
+        help='If set, restrict generation to this one task string (e.g. "place the cross into the mug_no_handle").',
     )
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel environments")
     parser.add_argument("--horizon", type=int, default=220, help="Max steps per episode")
@@ -1869,15 +1913,32 @@ def main():
     logger = _setup_logger(out_dir, args.log_level)
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2) + "\n")
 
+    task_arg = str(args.task).strip().lower()
+    tasks_to_run = None
+    if task_arg:
+        if task_arg not in [t.lower() for t in ALL_TASKS]:
+            raise ValueError(
+                f"--task not recognized: {args.task!r}\n"
+                f"Expected one of: {ALL_TASKS}"
+            )
+        # Preserve original string formatting from ALL_TASKS for stable folder names.
+        tasks_to_run = [next(t for t in ALL_TASKS if t.lower() == task_arg)]
+
     info = generate_dataset(
         env,
         n_success_episodes=args.n_success,
         per_task_success=int(args.per_task_success),
+        tasks_to_run=tasks_to_run,
         horizon=args.horizon,
         demos_dir=demos_dir,
         planner_params=PickPlaceParams(
             use_orientation_control=bool(args.use_orientation_control),
             rotate_for_grasp_enable=not bool(args.no_rotate_for_grasp),
+            stage_offset_rules=[
+                StageOffsetRule(stage="place", container="mug", delta_xyz=(0.00, 0.00, 0.05)),
+                StageOffsetRule(stage="place", container="mug_no_handle", delta_xyz=(0.00, 0.00, 0.05)),
+                StageOffsetRule(stage="place", container="bin", delta_xyz=(0.00, 0.00, 0.02)),
+            ],
         ),
         videos_dir=videos_dir,
         max_videos=args.max_videos,

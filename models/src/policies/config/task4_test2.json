@@ -25,23 +25,26 @@
         "future": 0
       },
       {
-        "key": "env_state",
-        "shape": [45],
-        "source_type": "hdf5",
-        "paths": ["obs/object_rel_eef"],
-        "camera_names": [],
+        "key": "images",
+        "shape": [3, 256, 256],
+        "source_type": "video",
+        "paths": [],
+        "camera_names": ["agentview", "robot0_eye_in_hand"],
         "history": 0,
         "future": 0
       }
     ]
   },
   "dataset": {
-    "data_dir": "/mnt/ssd/yixiao/cg/datasetv2/processed_all",
-    "cameras": [],
+    "data_dir": "/mnt/ssd/yixiao/cg/4tasks/gen_20260415-162543/smallfiles",
+    "task_filter": {
+      "include_task_slugs": ["cross_into_bin", "cross_into_mug_no_handle", "cross_into_mug"]
+    },
+    "cameras": ["agentview", "robot0_eye_in_hand"],
     "split": { "val_fraction": 0.01, "split_seed": 0 },
     "sampling": {
       "k_passes": 8,
-      "active_window_shards": 20,
+      "active_window_shards": 10,
       "locality_block_size": 64,
       "predecode_next_block": true,
       "frame_cache_max_entries": 12000,
@@ -49,15 +52,15 @@
       "profile_every_samples": 500,
       "log_stall_ms": 200.0
     },
-    "loader": { "batch_size": 128, "num_workers": 16, "prefetch_factor": 4 }
+    "loader": { "batch_size": 64, "num_workers": 16, "prefetch_factor": 4 }
   },
   "processor": {
     "normalization_type": "minmax",
     "normalize_actions": true,
     "normalize_states": true,
     "add_task_indices": true,
-    "obj_to_idx": { "cross": 0, "cube": 1, "cylinder": 2 },
-    "container_to_idx": { "bin": 0, "cup": 1, "plate": 2 }
+    "obj_to_idx": { "cross": 0, "cube": 1, "cylinder": 2, "milk": 3},
+    "container_to_idx": { "bin": 0, "mug": 1, "plate": 2, "mug_no_handle": 3}
   },
   "model": {
     "vision_model_size": "small",
@@ -74,9 +77,7 @@
     "fusion_mask_type": "none",
     "camera_feature_combine": "concat",
     "num_query_tokens": 2,
-    "down_dims": [128, 256, 512],
-    "env_state_mode": "direct_select",
-    "direct_select_use_task_emb": false
+    "down_dims": [128, 256, 512]
   },
   "algo": {
     "path_type": "linear",
@@ -97,27 +98,31 @@
     "beta_beta": 1.0
   },
   "train": {
-    "device": "",
+    "device": "cuda:1",
     "lr": 0.0001,
     "weight_decay": 0.0001,
-    "amp": false,
+    "amp": true,
     "grad_clip_norm": 1.0,
-    "num_steps": 100000,
+    "num_steps": 50000,
     "num_data_warmup": 50,
     "log_every": 500,
     "eval_every": 500,
     "eval_num_batches": 10,
     "eval_best_of_k": 4,
     "save_every": 5000,
-    "lr_schedule": { "type": "cosine", "warmup_steps": 1000, "min_lr_ratio": 0.0001 }
+    "lr_schedule": {
+      "type": "cosine",
+      "warmup_steps": 1000,
+      "min_lr_ratio": 0.0001
+    }
   },
   "logging": {
-    "out_dir": "runs/state_all_10kstep_no_task_emb",
+    "out_dir": "runs/task4_test",
     "wandb": {
       "enabled": true,
-      "project": "rp",
+      "project": "robot_flow_training",
       "entity": "yixiao_wang",
-      "run_name": "exp_state_all_10kstep_no_task_emb"
+      "run_name": "task4_test"
     }
   }
 }

@@ -128,11 +128,11 @@ class FlowMatchingEnvStateAttentionNetwork(nn.Module):
                 nn.LayerNorm(self.env_entity_dim),
                 nn.Linear(self.env_entity_dim, self.pooled_dim),
             )
-            # One learnable vector per object/container class so the policy
-            # knows *which* object it is picking and *which* container it targets,
-            # independently of the pose values.
-            self.obj_task_emb = nn.Embedding(self.num_objects, self.pooled_dim)
-            self.cont_task_emb = nn.Embedding(self.num_containers, self.pooled_dim)
+            # Optional learnable class embeddings (one per object/container type).
+            self.direct_select_use_task_emb: bool = config.direct_select_use_task_emb
+            if self.direct_select_use_task_emb:
+                self.obj_task_emb = nn.Embedding(self.num_objects, self.pooled_dim)
+                self.cont_task_emb = nn.Embedding(self.num_containers, self.pooled_dim)
 
         else:
             raise ValueError(
@@ -206,8 +206,11 @@ class FlowMatchingEnvStateAttentionNetwork(nn.Module):
         obj_entity = entities[batch_idx, obj_ids]                      # (Bflat, entity_dim)
         cont_entity = entities[batch_idx, self.num_objects + cont_ids]  # (Bflat, entity_dim)
 
-        obj_feat = self.obj_select_proj(obj_entity) + self.obj_task_emb(obj_ids)    # (Bflat, pooled_dim)
-        cont_feat = self.cont_select_proj(cont_entity) + self.cont_task_emb(cont_ids)  # (Bflat, pooled_dim)
+        obj_feat = self.obj_select_proj(obj_entity)    # (Bflat, pooled_dim)
+        cont_feat = self.cont_select_proj(cont_entity)  # (Bflat, pooled_dim)
+        if self.direct_select_use_task_emb:
+            obj_feat = obj_feat + self.obj_task_emb(obj_ids)
+            cont_feat = cont_feat + self.cont_task_emb(cont_ids)
         return torch.cat([obj_feat, cont_feat], dim=-1)  # (Bflat, 2*pooled_dim)
 
     def encode_observations(

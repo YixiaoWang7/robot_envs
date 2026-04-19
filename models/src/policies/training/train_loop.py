@@ -105,6 +105,7 @@ class RobotFlowTrainer:
         for step in range(1, int(self.train_cfg.num_steps) + 1):
             t_fetch0 = time.perf_counter()
             batch, prefetch_iter = self._next_batch(prefetcher, prefetch_iter)
+            
             fetch_ms = (time.perf_counter() - t_fetch0) * 1000.0
             train_kwargs = self.input_adapter.pack_train(batch)
             actions = train_kwargs["actions"]

@@ -64,9 +64,22 @@ class DataLoaderConfig(_Strict):
     prefetch_factor: int = 4
 
 
+class DatasetTaskFilterConfig(_Strict):
+    """
+    Optional task-level filtering.
+
+    Task slugs correspond to the subfolder names under `dataset.data_dir` and to
+    `tasks[*].task_slug` entries in `dataset_manifest.json`.
+    """
+
+    include_task_slugs: Tuple[str, ...] = ()
+    exclude_task_slugs: Tuple[str, ...] = ()
+
+
 class DatasetSection(_Strict):
     data_dir: str
     cameras: Tuple[str, ...] = ("agentview", "robot0_eye_in_hand")
+    task_filter: DatasetTaskFilterConfig = Field(default_factory=DatasetTaskFilterConfig)
     split: DatasetSplitConfig = Field(default_factory=DatasetSplitConfig)
     sampling: DatasetSamplingConfig = Field(default_factory=DatasetSamplingConfig)
     loader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)

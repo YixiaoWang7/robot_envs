@@ -361,6 +361,44 @@ def split_shard_metas(
     return out
 
 
+def filter_shard_metas_by_task(
+    metas: list[ShardMeta],
+    *,
+    include_task_slugs: Optional[Iterable[str]] = None,
+    exclude_task_slugs: Optional[Iterable[str]] = None,
+) -> list[ShardMeta]:
+    """
+    Filters shard metas by task slug.
+
+    Args:
+        metas (list[ShardMeta]): Input shard metadata list.
+        include_task_slugs (Optional[Iterable[str]]): If provided, only keep these task slugs.
+        exclude_task_slugs (Optional[Iterable[str]]): If provided, drop these task slugs.
+
+    Returns:
+        list[ShardMeta]: Filtered shard list.
+    """
+    include = None if include_task_slugs is None else {str(s) for s in include_task_slugs}
+    exclude = None if exclude_task_slugs is None else {str(s) for s in exclude_task_slugs}
+    if include is not None and exclude is not None and (include & exclude):
+        overlap = sorted(include & exclude)
+        raise ValueError(f"include_task_slugs and exclude_task_slugs overlap: {overlap}")
+    out = metas
+    if include is not None:
+        out = [m for m in out if str(m.task_slug) in include]
+    if exclude is not None:
+        out = [m for m in out if str(m.task_slug) not in exclude]
+    if not out:
+        avail = sorted({str(m.task_slug) for m in metas})
+        raise ValueError(
+            "No shards left after task filtering. "
+            f"Available task_slugs={avail}. "
+            f"include_task_slugs={None if include is None else sorted(include)} "
+            f"exclude_task_slugs={None if exclude is None else sorted(exclude)}"
+        )
+    return out
+
+
 def _load_window_data(
     data_dir: "Path",
     metas: "list[ShardMeta]",
@@ -776,6 +814,8 @@ class RobotDataset(IterableDataset):
         split: Literal["train", "val", "all"] = "train",
         val_fraction: float = 0.05,
         split_seed: int = 0,
+        include_task_slugs: Optional[Iterable[str]] = None,
+        exclude_task_slugs: Optional[Iterable[str]] = None,
         profile_timing: bool = False,
         profile_every_samples: int = 500,
         log_stall_ms: float = 200.0,
@@ -798,6 +838,9 @@ class RobotDataset(IterableDataset):
             split (Literal["train", "val", "all"]): Split name.
             val_fraction (float): Validation split fraction.
             split_seed (int): Split seed.
+            include_task_slugs (Optional[Iterable[str]]): If provided, only load these
+                task slugs (subfolder names under the dataset root).
+            exclude_task_slugs (Optional[Iterable[str]]): If provided, drop these task slugs.
             profile_timing (bool): Enable profile logs.
             profile_every_samples (int): Profile log cadence.
             log_stall_ms (float): Print a STALL line whenever any single blocking
@@ -822,6 +865,8 @@ class RobotDataset(IterableDataset):
         self.split = str(split)
         self.val_fraction = float(val_fraction)
         self.split_seed = int(split_seed)
+        self.include_task_slugs = None if include_task_slugs is None else list(include_task_slugs)
+        self.exclude_task_slugs = None if exclude_task_slugs is None else list(exclude_task_slugs)
         self.profile_timing = bool(profile_timing)
         self.profile_every_samples = int(profile_every_samples)
         self.log_stall_ms = float(log_stall_ms)
@@ -840,6 +885,9 @@ class RobotDataset(IterableDataset):
             raise ValueError("profile_every_samples must be > 0")
 
         shards_all = load_shard_metas_from_manifests(str(self.data_dir))
+        shards_all = filter_shard_metas_by_task(
+            shards_all, include_task_slugs=self.include_task_slugs, exclude_task_slugs=self.exclude_task_slugs
+        )
         self.shards = split_shard_metas(
             shards_all, split=self.split, val_fraction=self.val_fraction, split_seed=self.split_seed  # type: ignore[arg-type]
         )

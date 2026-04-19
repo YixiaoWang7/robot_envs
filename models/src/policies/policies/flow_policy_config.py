@@ -64,4 +64,8 @@ class AttentionModelConfig(BaseModel):
     #                     7-D pose through a dedicated head to pooled_dim, then
     #                     concatenate.  Simpler / expert-policy baseline; no attention.
     env_state_mode: Literal["attention_pool", "direct_select"] = "attention_pool"
+    # When env_state_mode == "direct_select", whether to add a learnable class
+    # embedding (one per object / container type) on top of the projected pose.
+    # Set to False for a pure pose-only baseline.
+    direct_select_use_task_emb: bool = True
 

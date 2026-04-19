@@ -5,9 +5,11 @@ Schema-driven data processor for robot manipulation datasets.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Literal, Mapping, Optional
+import re
+from typing import Dict, Iterable, Literal, Mapping, Optional
 
 import h5py
 import numpy as np
@@ -25,6 +27,7 @@ class ProcessorConfig(BaseModel):
     normalization_type: Literal["zscore", "minmax"] = "zscore"
     normalize_actions: bool = True
     normalize_states: bool = True
+    stats_cache_path: str = ""
     add_task_indices: bool = False
     obj_to_idx: Dict[str, int] = Field(default_factory=dict)
     container_to_idx: Dict[str, int] = Field(default_factory=dict)
@@ -46,6 +49,8 @@ class RobotProcessor:
         config: ProcessorConfig | None = None,
         feature_config: FeatureConfig | None = None,
         preloaded_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+        include_task_slugs: Optional[Iterable[str]] = None,
+        exclude_task_slugs: Optional[Iterable[str]] = None,
         # Legacy positional args kept for backward compat with old scripts.
         task_files: Optional[Dict[str, str]] = None,
         normalization_type: str | None = None,
@@ -70,6 +75,8 @@ class RobotProcessor:
         self.normalization_type = config.normalization_type
         self.normalize_actions = config.normalize_actions
         self.normalize_states = config.normalize_states
+        self.include_task_slugs = None if include_task_slugs is None else [str(s) for s in include_task_slugs]
+        self.exclude_task_slugs = None if exclude_task_slugs is None else [str(s) for s in exclude_task_slugs]
         self.add_task_indices = config.add_task_indices
         self.obj_to_idx = dict(config.obj_to_idx) if config.obj_to_idx else None
         self.container_to_idx = dict(config.container_to_idx) if config.container_to_idx else None
@@ -85,25 +92,78 @@ class RobotProcessor:
     def infer_task_indices(self, tasks: list[str]) -> torch.Tensor:
         if self.obj_to_idx is None or self.container_to_idx is None:
             raise ValueError("infer_task_indices requires obj_to_idx and container_to_idx to be set on RobotProcessor")
+
+        def _norm(s: str) -> str:
+            # Lowercase and collapse non-alphanumerics into spaces so we can do
+            # robust word-boundary matching across punctuation/underscores.
+            return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+        def _best_match_idx(text: str, mapping: dict[str, int]) -> Optional[int]:
+            nt = _norm(text)
+            if not nt:
+                return None
+            # Prefer the most specific key (longest normalized phrase).
+            keys = sorted(mapping.keys(), key=lambda k: (-len(_norm(k)), _norm(k)))
+            for k in keys:
+                nk = _norm(k)
+                if not nk:
+                    continue
+                # Word-boundary match so "mug" doesn't match inside "mugging".
+                if re.search(rf"\b{re.escape(nk)}\b", nt):
+                    return int(mapping[k])
+            return None
+
         obj_idx = torch.zeros((len(tasks),), dtype=torch.long)
         cont_idx = torch.zeros((len(tasks),), dtype=torch.long)
         for i, t in enumerate(tasks):
-            tl = (t or "").lower()
-            for k, v in self.obj_to_idx.items():
-                if k in tl:
-                    obj_idx[i] = int(v)
-                    break
-            for k, v in self.container_to_idx.items():
-                if k in tl:
-                    cont_idx[i] = int(v)
-                    break
+            oi = _best_match_idx(t, self.obj_to_idx)
+            if oi is not None:
+                obj_idx[i] = int(oi)
+            ci = _best_match_idx(t, self.container_to_idx)
+            if ci is not None:
+                cont_idx[i] = int(ci)
         return torch.stack([obj_idx, cont_idx], dim=1)
 
     def _normalizable_features(self) -> tuple[FeatureDef, ...]:
         return tuple(fd for fd in self.feature_config.features if fd.is_hdf5)
 
+    def _task_filter_signature(self) -> str:
+        inc = [] if self.include_task_slugs is None else sorted(self.include_task_slugs)
+        exc = [] if self.exclude_task_slugs is None else sorted(self.exclude_task_slugs)
+        return f"inc={inc}|exc={exc}"
+
     def _cache_path(self) -> Path:
+        if self.data_dir is None:
+            raise ValueError("RobotProcessor requires data_dir to compute normalization stats.")
+        configured = str(self._config.stats_cache_path or "").strip()
+        if configured:
+            p = Path(configured)
+            return p if p.is_absolute() else (self.data_dir / p)
+        if (self.include_task_slugs is not None) or (self.exclude_task_slugs is not None):
+            h = hashlib.md5(self._task_filter_signature().encode("utf-8")).hexdigest()[:10]
+            return self.data_dir / f"normalization_stats__tasks_{h}.npz"
         return self.data_dir / "normalization_stats.npz"
+
+    def _filter_tasks(self, tasks: list[dict]) -> list[dict]:
+        include = None if self.include_task_slugs is None else {str(s) for s in self.include_task_slugs}
+        exclude = None if self.exclude_task_slugs is None else {str(s) for s in self.exclude_task_slugs}
+        if include is not None and exclude is not None and (include & exclude):
+            overlap = sorted(include & exclude)
+            raise ValueError(f"include_task_slugs and exclude_task_slugs overlap: {overlap}")
+        out = tasks
+        if include is not None:
+            out = [t for t in out if str(t.get("task_slug", "")) in include]
+        if exclude is not None:
+            out = [t for t in out if str(t.get("task_slug", "")) not in exclude]
+        if not out:
+            avail = sorted({str(t.get("task_slug", "")) for t in tasks if str(t.get("task_slug", ""))})
+            raise ValueError(
+                "No tasks left after task filtering. "
+                f"Available task_slugs={avail}. "
+                f"include_task_slugs={None if include is None else sorted(include)} "
+                f"exclude_task_slugs={None if exclude is None else sorted(exclude)}"
+            )
+        return out
 
     def _legacy_role_to_key(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -189,7 +249,7 @@ class RobotProcessor:
                 return
             print("Cached normalization statistics are incompatible with current schema; recomputing...")
 
-        print("Computing normalization statistics from ALL demos (small-files)...")
+        print("Computing normalization statistics from demos (small-files)...")
         dataset_manifest_path = self.data_dir / "dataset_manifest.json"
         if not dataset_manifest_path.exists():
             raise FileNotFoundError(f"Expected small-files dataset_manifest.json at: {dataset_manifest_path}")
@@ -199,6 +259,10 @@ class RobotProcessor:
         tasks = ds.get("tasks", [])
         if not tasks:
             raise ValueError(f"No tasks found in {dataset_manifest_path}")
+        tasks = self._filter_tasks(list(tasks))
+        if (self.include_task_slugs is not None) or (self.exclude_task_slugs is not None):
+            kept = sorted({str(t.get("task_slug", "")) for t in tasks if str(t.get("task_slug", ""))})
+            print(f"Task filter active; computing stats over task_slugs={kept}")
 
         demo_index: list[dict[str, str]] = []
         for t in tasks:

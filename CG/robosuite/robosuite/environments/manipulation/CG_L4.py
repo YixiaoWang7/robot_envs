@@ -27,9 +27,9 @@ one_hot_dict = {
     "mug_no_handle": 10,
 }
 
-class CG_L2(ManipulationEnv):
+class CG_L4(ManipulationEnv):
     """
-    This class corresponds to the L2 task of CG benchmark, modified from Lift.
+    This class corresponds to the L4 task of CG benchmark, modified from Lift.
 
     Args:
         robots (str or list of str): Specification for specific robot arm(s) to be instantiated within this env
@@ -162,7 +162,6 @@ class CG_L2(ManipulationEnv):
     def __init__(
         self,
         robots,
-        strategy,
         env_configuration="default",
         controller_configs=None,
         gripper_types="default",
@@ -194,7 +193,7 @@ class CG_L2(ManipulationEnv):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
-        task=None,
+        task: str | None = None,
         initial_qpos=None,
     ):
         # settings for table top
@@ -215,14 +214,10 @@ class CG_L2(ManipulationEnv):
         self.object_A_init_pos = None
         self.object_B_init_pos = None
 
-        # parse language input
-        self.strategy = strategy
-        self.task = task
-        if self.strategy == "fixed":
-            if self.task is None:
-                raise ValueError("Task is required for fixed strategy")
-        else:
-            self.task = self.random_task()
+        # Parse language input (single-task env; task can be changed via `set_task()`).
+        if task is None:
+            raise ValueError("CG_L4 requires an explicit task string (e.g. 'place the cross into the bin').")
+        self.task = str(task).lower()
         
         
         self.language_vector = np.zeros(one_hot_dict.__len__())
@@ -283,6 +278,26 @@ class CG_L2(ManipulationEnv):
                 break
             i += 1
 
+    def _refresh_task_pointers(self) -> None:
+        """
+        Refresh `object_A/object_B` and their MuJoCo body ids from the current indices.
+
+        Safe to call before the model/sim exists.
+        """
+        if not hasattr(self, "object_A_list") or not hasattr(self, "object_B_list"):
+            return
+        self.object_A = self.object_A_list[int(self.object_A_index)]
+        self.object_B = self.object_B_list[int(self.object_B_index)]
+        if hasattr(self, "sim") and self.sim is not None:
+            self.object_A_body_id = self.sim.model.body_name2id(self.object_A.root_body)
+            self.object_B_body_id = self.sim.model.body_name2id(self.object_B.root_body)
+
+    def set_task(self, task: str) -> None:
+        """Set the current task string and refresh internal pointers."""
+        self.task = str(task).lower()
+        self.parse_task()
+        self._refresh_task_pointers()
+
     def update_task(self, new_task):
         """
         Update the language task and reset task configuration accordingly
@@ -290,73 +305,18 @@ class CG_L2(ManipulationEnv):
         Args:
             new_task (str): New task to set ("place", "push", or "stack")
         """
-        # Validate new task
-        new_task = new_task.lower()
-        
-        # Only proceed if task actually changed
-        if new_task != self.task:
-            self.task = new_task
-            self.parse_task()
-    
-    def random_task(self):
-        """
-        Generate a random task string based on the available objects
-
-        Returns:
-            str: Randomly generated task
-        """
-        
-        # # "L2": [[0,0],[0,2],[2,0],[2,2]]
-        # "Sfull":[[0,2],[1,0],[2,1]]
-        # "diagmid":[[0,2],[1,0],[1,2],[2,0],[2,1]]
-        # "diagcorner":[[0,1],[1,0],[1,2],[2,0],[2,1]]
-        
-        from random import choice
-        num_A = len(object_A_index)  # 3
-        num_B = len(object_B_index)  # 3
-        if self.strategy == "all":
-            random_list = [(a, b) for a in range(num_A) for b in range(num_B)]  # all 3x3
-        elif self.strategy == "L":
-            random_list = [(1, 1), (1, 2), (2, 1), (2, 2)]
-        elif self.strategy == "only-00":
-            random_list = [(0, 0)]
-        elif self.strategy == "S":
-            random_list = [(0, 2), (1, 0), (2, 0), (2, 1)]
-        elif self.strategy == "diag":
-            random_list = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
-        elif self.strategy == "L2":
-            random_list = [(0, 0), (0, 2), (2, 0), (2, 2)]
-        elif self.strategy == "Sfull":
-            random_list = [(0, 2), (1, 0), (2, 1)]
-        elif self.strategy == "diagmid":
-            random_list = [(0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
-        elif self.strategy == "diagcorner":
-            random_list = [(0, 1), (1, 0), (1, 2), (2, 0), (2, 1)]
-        else:
-            raise ValueError(f"Invalid strategy: {self.strategy}")
-        
-        
-        object_A_idx, object_B_idx = choice(random_list)
-        object_A = list(object_A_index.keys())[object_A_idx]
-        object_B = list(object_B_index.keys())[object_B_idx]
-        print(f"Random task: {object_A} into {object_B}")
-        
-        
-        return f"place the {object_A} into the {object_B}"
+        self.set_task(new_task)
     
     def reset(self):
         """
-        Reset the environment and handle task changes, generating a new task each time.
+        Reset the environment for the current task.
         """
-        # Generate and parse a new task
-        if self.strategy != "fixed":
-            self.task = self.random_task()
-            
-            
         self.parse_task()
+        self._refresh_task_pointers()
 
         # Call parent reset
         obs = super().reset()
+        self._refresh_task_pointers()
         
         # # If task was changed since last reset, reconfigure
         # if hasattr(self, '_last_task') and self._last_task != self.task:
@@ -914,6 +874,3 @@ class CG_L2(ManipulationEnv):
 
         return False
         
-
-# Backwards-compatible export: some code expects `CG_L4` symbol.
-CG_L4 = CG_L2

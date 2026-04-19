@@ -1,0 +1,39 @@
+{
+  "eval_config": {
+    "checkpoint": "/path/to/checkpoint.pt",
+    "device": "cuda",
+    "n_episodes": 50,
+    "num_envs": 2,
+    "horizon": 200,
+    "n_execute": 8,
+    "max_videos": 10,
+    "seed": 0,
+    "out_dir": "artifacts"
+  },
+  "tasks": [
+    "place the cross into the bin",
+    "place the cross into the mug",
+    "place the cross into the mug_no_handle",
+    "place the cross into the plate",
+    "place the cube into the bin",
+    "place the cube into the mug",
+    "place the cube into the mug_no_handle",
+    "place the cube into the plate",
+    "place the cylinder into the bin",
+    "place the cylinder into the mug",
+    "place the cylinder into the mug_no_handle",
+    "place the cylinder into the plate",
+    "place the milk into the bin",
+    "place the milk into the mug",
+    "place the milk into the mug_no_handle",
+    "place the milk into the plate"
+  ],
+  "result_config": {
+    "save_rollouts": true,
+    "save_videos": true,
+    "save_per_episode_details": true,
+    "save_per_task_breakdown": true,
+    "include_action_statistics": true,
+    "include_reward_statistics": true
+  }
+}
