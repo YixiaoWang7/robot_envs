@@ -16,9 +16,11 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from collections import deque, defaultdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +32,74 @@ from CG_L2_state_wrapper import StateBasedCGWrapper
 _L4_OBJECTS = ("cross", "cube", "cylinder", "milk")
 _L4_CONTAINERS = ("bin", "mug", "plate", "mug_no_handle")
 _ALL_TASKS = [f"place the {o} into the {c}" for o in _L4_OBJECTS for c in _L4_CONTAINERS]
+
+
+@dataclass(frozen=True)
+class EvalSeedPlan:
+    root_seed: int
+    global_seed: int
+    episode_task_seeds: list[int]
+    episode_reset_seeds: list[int]
+    batch_policy_seeds: list[int]
+
+
+def _seedseq_to_int(seq: np.random.SeedSequence) -> int:
+    return int(seq.generate_state(1, dtype=np.uint32)[0])
+
+
+def _build_seed_plan(*, root_seed: int, n_episodes: int, num_envs: int) -> EvalSeedPlan:
+    n_batches = math.ceil(n_episodes / max(num_envs, 1))
+    root = np.random.SeedSequence(int(root_seed))
+    global_seq, task_root, reset_root, policy_root = root.spawn(4)
+    return EvalSeedPlan(
+        root_seed=int(root_seed),
+        global_seed=_seedseq_to_int(global_seq),
+        episode_task_seeds=[_seedseq_to_int(seq) for seq in task_root.spawn(n_episodes)],
+        episode_reset_seeds=[_seedseq_to_int(seq) for seq in reset_root.spawn(n_episodes)],
+        batch_policy_seeds=[_seedseq_to_int(seq) for seq in policy_root.spawn(n_batches)],
+    )
+
+
+def _set_global_seed(seed: int, *, deterministic: bool) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return
+
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+
+def _set_torch_seed(seed: int) -> None:
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return
+
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _sample_episode_tasks(eval_tasks: list[str], task_seeds: list[int]) -> list[str]:
+    allow_list = [str(t) for t in eval_tasks]
+    if not allow_list:
+        raise ValueError("eval_tasks must not be empty")
+    sampled: list[str] = []
+    for seed in task_seeds:
+        rng = np.random.default_rng(int(seed))
+        sampled.append(str(rng.choice(allow_list)))
+    return sampled
 
 
 # ---------------------------------------------------------------------------
@@ -218,16 +288,21 @@ def run_batch(
     fps: int,
     video_paths: list[Path],
     episode_offset: int,
-    eval_tasks: list[str],
+    episode_tasks: list[str],
+    reset_seeds: list[int],
+    policy_seed: int,
 ) -> dict:
     """
     Run one full batched rollout (all envs until done or horizon).
     Supports both image-conditioned and env_state-conditioned checkpoints.
     """
     num_envs = env.num_envs
-    # Let the wrapper sample tasks from this allow-list each episode.
-    env.train_task = eval_tasks
-    obs, _ = env.reset()
+    if len(episode_tasks) != num_envs:
+        raise ValueError(f"episode_tasks must have length {num_envs}, got {len(episode_tasks)}")
+    if len(reset_seeds) != num_envs:
+        raise ValueError(f"reset_seeds must have length {num_envs}, got {len(reset_seeds)}")
+
+    obs, _ = env.reset(tasks=episode_tasks, reset_seeds=reset_seeds)
 
     done = [False] * num_envs
     sum_rewards = [0.0] * num_envs
@@ -260,6 +335,7 @@ def run_batch(
     env_state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)] if use_env_state else []
     img_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)] if use_images else []
     action_queues: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
+    policy_rng = np.random.default_rng(int(policy_seed))
 
     def _seed_history(i: int):
         state_hists[i].append(obs["observation.state"][i].astype(np.float32))
@@ -320,6 +396,7 @@ def run_batch(
                 model_kwargs["images"] = images_batch
             # print(model_kwargs)
             with torch.no_grad():
+                _set_torch_seed(int(policy_rng.integers(0, np.iinfo(np.int32).max, dtype=np.int64)))
                 actions_norm = policy.model.generate_actions(**model_kwargs)
                 actions_denorm = policy.denormalize_actions(actions_norm)
 
@@ -333,6 +410,7 @@ def run_batch(
             if not done[i] and action_queues[i]:
                 action_mat[i] = action_queues[i].pop(0)
 
+        # time.sleep(0.1)
         obs, rew, terminated, truncated, info = env.step(action_mat.astype(np.float32))
         successes = np.asarray(info.get("is_success", [False] * num_envs))
 
@@ -415,6 +493,7 @@ def eval_policy(
     seed: int,
     eval_tasks: list[str],
     result_config: dict,
+    seed_plan: EvalSeedPlan,
 ) -> dict:
     """
     Run ceil(n_episodes / num_envs) batched rollouts and aggregate metrics.
@@ -426,8 +505,7 @@ def eval_policy(
     rollouts_dir = out_dir / "rollouts"
     videos_dir.mkdir(parents=True, exist_ok=True)
     rollouts_dir.mkdir(parents=True, exist_ok=True)
-
-    np.random.seed(seed)
+    episode_tasks = _sample_episode_tasks(eval_tasks, seed_plan.episode_task_seeds)
 
     all_episodes: list[dict] = []
     n_episodes_rendered = 0
@@ -455,6 +533,14 @@ def eval_policy(
             f"(record_video={record_this_batch})"
         )
 
+        batch_tasks = episode_tasks[ep_offset : ep_offset + num_envs]
+        batch_reset_seeds = seed_plan.episode_reset_seeds[ep_offset : ep_offset + num_envs]
+        batch_policy_seed = seed_plan.batch_policy_seeds[batch_ix]
+        if len(batch_tasks) < num_envs:
+            pad = num_envs - len(batch_tasks)
+            batch_tasks.extend(batch_tasks[-1:] * pad)
+            batch_reset_seeds.extend(batch_reset_seeds[-1:] * pad)
+
         batch = run_batch(
             env,
             policy,
@@ -465,7 +551,9 @@ def eval_policy(
             fps=fps,
             video_paths=video_paths_batch,
             episode_offset=ep_offset,
-            eval_tasks=eval_tasks,
+            episode_tasks=batch_tasks,
+            reset_seeds=batch_reset_seeds,
+            policy_seed=batch_policy_seed,
         )
 
         # Rename video files to include success/failure and task
@@ -500,7 +588,10 @@ def eval_policy(
                 "sum_reward":  float(batch["sum_reward"][i]),
                 "max_reward":  float(batch["max_reward"][i]),
                 "length":      int(batch["length"][i]),
-                "seed":        seed + ep_ix,
+                "seed":        int(seed_plan.episode_reset_seeds[ep_ix]),
+                "root_seed":   int(seed_plan.root_seed),
+                "task_seed":   int(seed_plan.episode_task_seeds[ep_ix]),
+                "policy_seed": int(batch_policy_seed),
                 "video":       video_path_str,
             })
 
@@ -664,6 +755,9 @@ def main():
         }
 
     os.environ.setdefault("MUJOCO_GL", "egl")
+    deterministic_eval = True
+    seed_plan = _build_seed_plan(root_seed=seed, n_episodes=n_episodes, num_envs=num_envs)
+    _set_global_seed(seed_plan.global_seed, deterministic=deterministic_eval)
 
     # if num_envs % 2 != 0:
     #     raise ValueError("--num-envs must be even (ImageBasedCGWrapper requirement)")
@@ -690,7 +784,10 @@ def main():
     fps = int(getattr(env.envs[0], "control_freq", 20))
     print(f"env control_freq={fps} Hz | num_envs={num_envs}")
 
-    obs, _ = env.reset()
+    probe_task = str(tasks[0] if tasks else _ALL_TASKS[0])
+    probe_tasks = [probe_task for _ in range(num_envs)]
+    probe_reset_seeds = [int(seed_plan.global_seed + i) for i in range(num_envs)]
+    obs, _ = env.reset(tasks=probe_tasks, reset_seeds=probe_reset_seeds)
     policy_state_dim = int(np.prod(policy.state_feature.shape))
     env_state_dim = int(obs["observation.state"].shape[-1])
     if policy_state_dim != env_state_dim:
@@ -735,6 +832,10 @@ def main():
         "task": task,
         "eval_tasks": tasks,
         "result_config": result_config,
+        "reproducibility": {
+            "deterministic_torch": deterministic_eval,
+            "seed_plan": asdict(seed_plan),
+        },
     }
     (out_dir_path / "eval_config_used.json").write_text(
         json.dumps(eval_params, indent=2) + "\n", encoding="utf-8"
@@ -754,6 +855,7 @@ def main():
         seed=seed,
         eval_tasks=tasks,
         result_config=result_config,
+        seed_plan=seed_plan,
     )
 
     env.close()

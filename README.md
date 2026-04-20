@@ -108,7 +108,7 @@ You can override any `eval_config` field from the command line:
 python eval_policy_l4.py --config eval_config.json --n-episodes 200 --seed 42
 ```
 
-python tests/eval_policy_l4.py --config tests/test_configs/full.json --checkpoint 
+python tests/eval_policy_l4.py --config tests/test_configs/full.json --checkpoint /home/yixiao/Documents/code/robopolicy/runs/l4_1s_bs128/checkpoints/ckpt_step_0100000.pt
 
 
 python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 213 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 763 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 7  
@@ -235,3 +235,102 @@ python tests/generate_cg_l4_motion_planning.py \
     --out-dir /mnt/ssd/data/cg/l4 \
     --max-videos 5
 ```
+
+### Two-stage generation (pick/place twice)
+
+Two-stage episodes are implemented by the high-level planner in:
+
+- `tests/cg_l4_two_stage_planner.py`
+
+The generator script `tests/generate_cg_l4_motion_planning.py` exposes a CLI for it.
+
+#### Option A — Enumerate all two-stage combos
+
+```bash
+python tests/generate_cg_l4_motion_planning.py \
+  --two-stage \
+  --two-stage-all-combos \
+  --per-combo-success 50 \
+  --num-envs 4 \
+  --horizon 300 \
+  --out-dir /mnt/ssd/data/cg/l4/two_stage \
+  --max-videos 10
+```
+
+#### Option B — Run user-defined combos (JSON)
+
+Create a JSON file like:
+
+```json
+{
+  "specs": [
+    {"obj0": "cross", "cont0": "bin", "obj1": "cube", "cont1": "mug"},
+    {"obj0": 3, "cont0": 0, "obj1": 1, "cont1": 2}
+  ]
+}
+```
+
+Then run:
+
+```bash
+python tests/generate_cg_l4_motion_planning.py \
+  --two-stage \
+  --two-stage-specs-json /path/to/two_stage_specs.json \
+  --per-combo-success 50 \
+  --num-envs 4 \
+  --horizon 300 \
+  --out-dir /mnt/ssd/data/cg/l4/two_stage \
+  --max-videos 10
+```
+
+#### Two-stage CLI arguments (explained)
+
+| Argument | Default | Description |
+|---|---:|---|
+| `--two-stage` | `False` | Enable two-stage episodes: (obj0→cont0) then (obj1→cont1). |
+| `--two-stage-specs-json` | `""` | Path to a JSON file containing explicit two-stage combos. Each spec must provide `obj0,cont0,obj1,cont1` as either **names** or **indices**. |
+| `--two-stage-all-combos` | `False` | Enumerate all ordered two-stage combos (subject to distinctness flags). |
+| `--per-combo-success` | `0` | If >0, save this many successful demos **per combo** (writes into per-combo subfolders). |
+| `--two-stage-max-combos` | `0` | Optional cap on number of combos to run after loading/enumeration. `0` means no cap. |
+| `--allow-same-object` | `False` | Allow `obj0 == obj1`. Default is distinct objects. |
+| `--allow-same-container` | `False` | Allow `cont0 == cont1`. Default is distinct containers. |
+
+#### Two-stage outputs (extra supervision)
+
+In addition to `actions` and the usual `obs/*`, two-stage demos include:
+
+- `obs/task_indices`: shape `(T, 2)` int64, current `[object_idx, container_idx]` per timestep
+- `obs/subtask_id`: shape `(T, 1)` int64, per-timestep label in `{0,1,2,3}`
+
+Subtask id semantics (also mirrored in the training config JSON):
+
+- `0`: pick obj0
+- `1`: place obj0 into cont0
+- `2`: pick obj1
+- `3`: place obj1 into cont1
+
+### Library usage (`tests/cg_l4_two_stage_planner.py`)
+
+If you want to use the planner directly in Python (instead of the CLI), the core API is:
+
+```python
+from cg_l4_two_stage_planner import TwoStagePickPlacePlanner, TwoStageTaskSpec
+
+spec = TwoStageTaskSpec(obj0=0, cont0=0, obj1=1, cont1=1)  # indices
+planner = TwoStagePickPlacePlanner(
+    spec=spec,
+    object_names=["cross", "cube", "cylinder", "milk"],
+    container_names=["bin", "mug", "plate", "mug_no_handle"],
+    low_level_planner_factory=make_low_level_planner,  # () -> planner with .reset/.get_action/.done/.phase
+)
+planner.reset()
+```
+
+Constructor arguments:
+
+| Argument | Type | Description |
+|---|---|---|
+| `spec` | `TwoStageTaskSpec` | The two-stage combo: `(obj0, cont0, obj1, cont1)` as **indices**. |
+| `object_names` | `list[str]` | Names array used to format stage task strings and labels. Indices in `spec` index into this list. |
+| `container_names` | `list[str]` | Container names array (same indexing rule as `object_names`). |
+| `low_level_planner_factory` | `() -> object` | Factory that returns a low-level pick/place planner instance implementing `reset()`, `get_action(env, eef_quat_xyzw=...)`, and attributes `done` (bool) and `phase` (str). |

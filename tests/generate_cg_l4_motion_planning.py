@@ -49,6 +49,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None  # type: ignore[assignment]
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CG_ROOT = REPO_ROOT / "CG"
 ROBOSUITE_ROOT = CG_ROOT / "robosuite"
@@ -64,6 +69,16 @@ from robosuite.utils.placement_samplers import UniformApartRandomSampler
 # This keeps "controller math" in one place and lets generation stay minimal.
 from test_motion_planner import ControllerParams as SimpleControllerParams
 from test_motion_planner import SimplePoseController as SimplePoseController
+
+from cg_l4_two_stage_planner import (
+    TwoStagePickPlacePlanner,
+    TwoStageTaskSpec,
+    enumerate_all_two_stage_combos,
+    load_two_stage_specs_json,
+    stage_task_string,
+    two_stage_task_slug,
+    two_stage_task_string,
+)
 
 
 OBJECT_NAMES = ["cross", "cube", "cylinder", "milk"]
@@ -277,9 +292,20 @@ def _make_video_frames(agentview: np.ndarray, eye_in_hand: np.ndarray) -> list[n
 
 
 def _task_short(task: str) -> str:
-    words = task.lower().split()
-    obj = next((w for w in words if w in OBJECT_NAMES), "obj")
-    cont = next((w for w in words if w in CONTAINER_NAMES), "cont")
+    # Normalize punctuation so tokens like "cross," still match.
+    import re
+
+    words = re.sub(r"[^a-z0-9_]+", " ", (task or "").lower()).split()
+
+    objs = [w for w in words if w in OBJECT_NAMES]
+    conts = [w for w in words if w in CONTAINER_NAMES]
+
+    # Two-stage label: include both pairs when present.
+    if len(objs) >= 2 and len(conts) >= 2:
+        return f"{objs[0]}_{conts[0]}__{objs[1]}_{conts[1]}"
+
+    obj = objs[0] if objs else "obj"
+    cont = conts[0] if conts else "cont"
     return f"{obj}_{cont}"
 
 
@@ -1490,6 +1516,10 @@ def save_demo_triplet(demo_dir: Path, ep: dict, *, fps: int = 20) -> None:
         obs_grp.create_dataset("object", data=ep["obj_world"], compression="gzip")
         if "env_state" in ep:
             obs_grp.create_dataset("environment_state", data=ep["env_state"], compression="gzip")
+        if "task_indices" in ep:
+            obs_grp.create_dataset("task_indices", data=np.asarray(ep["task_indices"], dtype=np.int64), compression="gzip")
+        if "subtask_id" in ep:
+            obs_grp.create_dataset("subtask_id", data=np.asarray(ep["subtask_id"], dtype=np.int64), compression="gzip")
         f.create_dataset("actions", data=ep["actions"], compression="gzip")
         f.attrs["task"] = str(ep["task"])
         f.attrs["planner"] = str(ep.get("planner", "simple_pick_place"))
@@ -1508,12 +1538,13 @@ def run_batch(
     horizon: int,
     planner_params: PickPlaceParams | None = None,
     tasks: list[str] | None = None,
+    two_stage_specs: list[TwoStageTaskSpec] | None = None,
     fps: int = 20,
     post_success_hold_s: float = 0.5,
 ) -> tuple[list[dict | None], dict]:
     obs, _ = env.reset(tasks=tasks)
-    planners = [
-        SimplePickPlacePlanner(
+    def _make_low_level() -> "SimplePickPlacePlanner":
+        return SimplePickPlacePlanner(
             waypoint_params=planner_params,
             max_step_size=0.05,
             pos_tol=0.005,
@@ -1523,8 +1554,27 @@ def run_batch(
             max_acceleration=0.15,
             use_smooth_stop=True,
         )
-        for _ in range(env.num_envs)
-    ]
+
+    use_two_stage = two_stage_specs is not None
+    if use_two_stage and len(two_stage_specs or []) != int(env.num_envs):
+        raise ValueError(f"two_stage_specs must have length {env.num_envs}, got {len(two_stage_specs or [])}")
+
+    if use_two_stage:
+        planners = [
+            TwoStagePickPlacePlanner(
+                spec=two_stage_specs[i],  # type: ignore[index]
+                object_names=OBJECT_NAMES,
+                container_names=CONTAINER_NAMES,
+                low_level_planner_factory=_make_low_level,
+            )
+            for i in range(env.num_envs)
+        ]
+        # Replace env task strings with the combined 2-stage label for logging/stats.
+        for i in range(env.num_envs):
+            env.tasks[i] = planners[i].episode_task_str()
+    else:
+        planners = [_make_low_level() for _ in range(env.num_envs)]
+
     for planner in planners:
         planner.reset()
 
@@ -1542,6 +1592,11 @@ def run_batch(
     buf_agentview = [[] for _ in range(env.num_envs)]
     buf_eye = [[] for _ in range(env.num_envs)]
     buf_actions = [[] for _ in range(env.num_envs)]
+    buf_task_indices = [[] for _ in range(env.num_envs)]
+    buf_subtask_id = [[] for _ in range(env.num_envs)]
+
+    last_task_indices = [np.array([0, 0], dtype=np.int64) for _ in range(env.num_envs)]
+    last_subtask_id = [np.array([0], dtype=np.int64) for _ in range(env.num_envs)]
 
     steps_taken = 0
     for step in range(horizon):
@@ -1583,6 +1638,20 @@ def run_batch(
             action_mat[i] = planners[i].get_action(env.envs[i], eef_quat_xyzw=eef_quat_xyzw)
             buf_actions[i].append(action_mat[i].copy())
 
+            if use_two_stage:
+                cur_ti = np.asarray(planners[i].current_task_indices(), dtype=np.int64)
+                cur_sid = np.array([int(planners[i].current_subtask_id())], dtype=np.int64)
+                last_task_indices[i] = cur_ti
+                last_subtask_id[i] = cur_sid
+            else:
+                # Single-stage: task indices are constant over time.
+                cur_ti = np.asarray([env.obj_indices[i], env.cont_indices[i]], dtype=np.int64)
+                cur_sid = np.array([0], dtype=np.int64)
+                last_task_indices[i] = cur_ti
+                last_subtask_id[i] = cur_sid
+            buf_task_indices[i].append(cur_ti.copy())
+            buf_subtask_id[i].append(cur_sid.copy())
+
         # print(eef_quat_xyzw)
         # print(action_mat)
 
@@ -1591,12 +1660,23 @@ def run_batch(
         for i in range(env.num_envs):
             if done[i]:
                 continue
-            # Full task success is provided by the environment.
-            if bool(info["is_success"][i]):
-                ep_success[i] = True
-                # Do not stop immediately: keep running until planner completes lift + post-success hold.
-            elif bool(terminated[i]) or bool(truncated[i]):
-                done[i] = True
+            if use_two_stage:
+                # Update two-stage success and possibly retarget stage 1.
+                planners[i].post_step(env.envs[i])
+                if bool(planners[i].just_switched_stage()):
+                    # Clear the wrapper's sticky success so stage 0 doesn't mask stage 1.
+                    env.is_success[i] = False
+                if bool(planners[i].episode_success()) and bool(planners[i].done):
+                    ep_success[i] = True
+                if (not ep_success[i]) and (bool(terminated[i]) or bool(truncated[i])):
+                    done[i] = True
+            else:
+                # Full task success is provided by the environment (single-stage).
+                if bool(info["is_success"][i]):
+                    ep_success[i] = True
+                    # Do not stop immediately: keep running until planner completes lift + post-success hold.
+                elif bool(terminated[i]) or bool(truncated[i]):
+                    done[i] = True
             if done[i]:
                 # Print pregrasp target vs final EEF for debugging (even for full task).
                 tgt = getattr(planners[i], "pregrasp_pos", None)
@@ -1628,8 +1708,12 @@ def run_batch(
             "actions": np.stack(buf_actions[i]),
             "task": env.tasks[i],
             "success": bool(ep_success[i]),
-            "planner": "simple_pick_place",
+            "planner": ("two_stage_simple_pick_place" if use_two_stage else "simple_pick_place"),
         }
+        if buf_task_indices[i]:
+            ep["task_indices"] = np.stack(buf_task_indices[i][:T]).astype(np.int64, copy=False)
+        if buf_subtask_id[i]:
+            ep["subtask_id"] = np.stack(buf_subtask_id[i][:T]).astype(np.int64, copy=False)
         # Add debug scalars (not used by training; useful for checking convergence).
         tgt = getattr(planners[i], "pregrasp_pos", None)
         cur = getattr(planners[i], "last_eef_pos", None)
@@ -1666,6 +1750,8 @@ def generate_dataset(
     n_success_episodes: int,
     per_task_success: int = 0,
     tasks_to_run: list[str] | None = None,
+    two_stage_specs: list[TwoStageTaskSpec] | None = None,
+    per_combo_success: int = 0,
     horizon: int,
     demos_dir: Path,
     planner_params: PickPlaceParams | None = None,
@@ -1684,15 +1770,31 @@ def generate_dataset(
 
     log = (logger.info if logger is not None else print)
     tasks_list = list(tasks_to_run) if tasks_to_run is not None else list(ALL_TASKS)
-    if int(per_task_success) > 0:
+    if (two_stage_specs is not None) and int(per_task_success) > 0:
+        raise ValueError("per_task_success is not supported in two-stage mode; use per_combo_success instead.")
+
+    if int(per_combo_success) > 0:
+        if two_stage_specs is None or not two_stage_specs:
+            raise ValueError("per_combo_success requires two_stage_specs to be provided (non-empty).")
+        target_total = int(per_combo_success) * len(list(two_stage_specs))
+        log(f"Target: {int(per_combo_success)} successes / combo x {len(list(two_stage_specs))} combos = {target_total} demos")
+    elif int(per_task_success) > 0:
         target_total = int(per_task_success) * len(tasks_list)
         log(f"Target: {int(per_task_success)} successes / task x {len(tasks_list)} tasks = {target_total} demos")
     else:
         target_total = int(n_success_episodes)
-        log(f"Target: {target_total} successful one-stage episodes")
+        tag = "two-stage" if two_stage_specs is not None else "one-stage"
+        log(f"Target: {target_total} successful {tag} episodes")
     log(f"Demos: {demos_dir}")
     if max_videos > 0 and videos_dir is not None:
         log(f"Videos: up to {max_videos} -> {videos_dir}")
+
+    def _make_pbar(*, total: int, desc: str):
+        if tqdm is None:
+            return None
+        return tqdm(total=int(total), desc=str(desc), unit="demo", dynamic_ncols=True)
+
+    overall_pbar = _make_pbar(total=int(target_total), desc="saved")
 
     def _maybe_save_review_video(ep: dict, *, attempt_id: int) -> None:
         if videos_dir is None or stats.videos >= max_videos:
@@ -1719,12 +1821,101 @@ def generate_dataset(
             stats.successful += 1
             stats.task_successes[str(ep["task"])] += 1
 
-    if int(per_task_success) > 0:
+    if int(per_combo_success) > 0:
+        # Per-combo mode: iterate 2-stage combos, and save K successes per combo into subfolders.
+        assert two_stage_specs is not None
+        combo_pbar = _make_pbar(total=int(per_combo_success), desc="combo_saved")
+        for spec in list(two_stage_specs):
+            obj0 = OBJECT_NAMES[int(spec.obj0)]
+            cont0 = CONTAINER_NAMES[int(spec.cont0)]
+            obj1 = OBJECT_NAMES[int(spec.obj1)]
+            cont1 = CONTAINER_NAMES[int(spec.cont1)]
+
+            combo_slug = two_stage_task_slug(obj0_name=obj0, cont0_name=cont0, obj1_name=obj1, cont1_name=cont1)
+            combo_task_str = two_stage_task_string(obj0_name=obj0, cont0_name=cont0, obj1_name=obj1, cont1_name=cont1)
+            stage0_task = stage_task_string(obj_name=obj0, cont_name=cont0)
+
+            task_dir = demos_dir / combo_slug
+            task_dir.mkdir(parents=True, exist_ok=True)
+            saved_for_combo = 0
+            if combo_pbar is not None:
+                combo_pbar.reset(total=int(per_combo_success))
+                combo_pbar.set_description(f"combo_saved:{combo_slug}")
+
+            log("-" * 60)
+            log(f"Combo: {combo_slug} | target={int(per_combo_success)} demos")
+            log(f"  task: {combo_task_str}")
+            log("-" * 60)
+
+            while saved_for_combo < int(per_combo_success):
+                batch += 1
+                log(
+                    f"[batch {batch}] {combo_slug} | saved_combo={saved_for_combo}/{int(per_combo_success)} | "
+                    f"saved_all={stats.saved}/{target_total}"
+                )
+
+                episodes, batch_info = run_batch(
+                    env,
+                    horizon=horizon,
+                    planner_params=planner_params,
+                    tasks=[stage0_task] * int(env.num_envs),
+                    two_stage_specs=[spec] * int(env.num_envs),
+                    fps=fps,
+                )
+                stats.attempted += int(batch_info["num_envs"])
+                base_attempt_id = stats.attempted - int(batch_info["num_envs"])
+                _record_task_attempts()
+
+                for i, ep in enumerate(episodes):
+                    if ep is None:
+                        continue
+
+                    # Override task label to the combined string (folder is stable slug).
+                    ep["task"] = combo_task_str
+                    _record_task_success(ep)
+                    attempt_id = base_attempt_id + i + 1
+
+                    if bool(ep.get("success", False)) and saved_for_combo < int(per_combo_success):
+                        demo_dir = task_dir / f"demo_{saved_for_combo:06d}"
+                        try:
+                            save_demo_triplet(demo_dir, ep, fps=fps)
+                            saved_for_combo += 1
+                            stats.saved += 1
+                            if combo_pbar is not None:
+                                combo_pbar.update(1)
+                            if overall_pbar is not None:
+                                overall_pbar.update(1)
+                        except Exception as exc:
+                            if logger is not None:
+                                logger.warning(f"  demo save failed ({demo_dir}): {exc}")
+                            else:
+                                print(f"  demo save failed ({demo_dir}): {exc}")
+
+                    _maybe_save_review_video(ep, attempt_id=attempt_id)
+                    tag = "success" if bool(ep.get("success", False)) else "fail"
+                    log(f"  ep | {tag:7s} | {ep['task']} | T={len(ep['actions'])}")
+
+                batch_sr = (int(batch_info["batch_successes"]) / max(int(batch_info["num_envs"]), 1)) * 100.0
+                overall_sr = (stats.successful / max(stats.attempted, 1)) * 100.0
+                saved_rate = (stats.saved / max(stats.attempted, 1)) * 100.0
+                log(
+                    f"[batch {batch}] done | steps={batch_info['steps_taken']}/{horizon} | "
+                    f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
+                    f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
+                )
+        if combo_pbar is not None:
+            combo_pbar.close()
+
+    elif int(per_task_success) > 0:
         # Per-task mode: iterate tasks, and save K successes per task into subfolders.
+        task_pbar = _make_pbar(total=int(per_task_success), desc="task_saved")
         for task in tasks_list:
             task_dir = demos_dir / _task_dir_name(task)
             task_dir.mkdir(parents=True, exist_ok=True)
             saved_for_task = 0
+            if task_pbar is not None:
+                task_pbar.reset(total=int(per_task_success))
+                task_pbar.set_description(f"task_saved:{task_dir.name}")
 
             log("-" * 60)
             log(f"Task: {task} | dir={task_dir.name} | target={int(per_task_success)} demos")
@@ -1758,6 +1949,10 @@ def generate_dataset(
                             save_demo_triplet(demo_dir, ep, fps=fps)
                             saved_for_task += 1
                             stats.saved += 1
+                            if task_pbar is not None:
+                                task_pbar.update(1)
+                            if overall_pbar is not None:
+                                overall_pbar.update(1)
                         except Exception as exc:
                             if logger is not None:
                                 logger.warning(f"  demo save failed ({demo_dir}): {exc}")
@@ -1777,25 +1972,44 @@ def generate_dataset(
                     f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
                     f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
                 )
+        if task_pbar is not None:
+            task_pbar.close()
     else:
         # Total mode: save N successes across all tasks into demos_dir/.
         while stats.saved < int(n_success_episodes):
             batch += 1
             log(f"[batch {batch}] start | saved={stats.saved}/{int(n_success_episodes)}")
 
-            # If a task subset is provided, sample tasks from it (or keep fixed for a single-task run).
             tasks = None
-            if tasks_to_run is not None:
-                if len(tasks_list) == 1:
-                    tasks = [tasks_list[0]] * int(env.num_envs)
+            specs_for_envs: list[TwoStageTaskSpec] | None = None
+
+            if two_stage_specs is not None and two_stage_specs:
+                # Sample two-stage combos for this batch.
+                if len(two_stage_specs) == 1:
+                    specs_for_envs = [two_stage_specs[0]] * int(env.num_envs)
                 else:
-                    tasks = [str(np.random.choice(tasks_list)) for _ in range(int(env.num_envs))]
+                    specs_for_envs = [two_stage_specs[int(np.random.randint(len(two_stage_specs)))] for _ in range(int(env.num_envs))]
+                tasks = [
+                    stage_task_string(
+                        obj_name=OBJECT_NAMES[int(s.obj0)],
+                        cont_name=CONTAINER_NAMES[int(s.cont0)],
+                    )
+                    for s in specs_for_envs
+                ]
+            else:
+                # Single-stage: If a task subset is provided, sample tasks from it (or keep fixed for a single-task run).
+                if tasks_to_run is not None:
+                    if len(tasks_list) == 1:
+                        tasks = [tasks_list[0]] * int(env.num_envs)
+                    else:
+                        tasks = [str(np.random.choice(tasks_list)) for _ in range(int(env.num_envs))]
 
             episodes, batch_info = run_batch(
                 env,
                 horizon=horizon,
                 planner_params=planner_params,
                 tasks=tasks,
+                two_stage_specs=specs_for_envs,
                 fps=fps,
             )
             stats.attempted += int(batch_info["num_envs"])
@@ -1814,6 +2028,8 @@ def generate_dataset(
                     try:
                         save_demo_triplet(demo_dir, ep, fps=fps)
                         stats.saved += 1
+                        if overall_pbar is not None:
+                            overall_pbar.update(1)
                     except Exception as exc:
                         if logger is not None:
                             logger.warning(f"  demo save failed ({demo_dir.name}): {exc}")
@@ -1833,6 +2049,9 @@ def generate_dataset(
                 f"batch_SR={batch_sr:.0f}% | overall_SR={overall_sr:.1f}% | saved_rate={saved_rate:.1f}% | "
                 f"attempted={stats.attempted} success={stats.successful} saved={stats.saved}"
             )
+
+    if overall_pbar is not None:
+        overall_pbar.close()
 
     elapsed = time.time() - start
     return {
@@ -1859,7 +2078,7 @@ def generate_dataset(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate CG_L4 one-stage demos with waypoint motion planning",
+        description="Generate CG_L4 demos with waypoint motion planning (one-stage or two-stage)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--n-success", type=int, default=200, help="Successful episodes to collect")
@@ -1874,6 +2093,44 @@ def main():
         type=str,
         default="",
         help='If set, restrict generation to this one task string (e.g. "place the cross into the mug_no_handle").',
+    )
+    parser.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="Enable 2-stage episodes: (obj0->cont0) then (obj1->cont1).",
+    )
+    parser.add_argument(
+        "--two-stage-specs-json",
+        type=str,
+        default="",
+        help="JSON file of explicit 2-stage combos. Format: [{'obj0':..., 'cont0':..., 'obj1':..., 'cont1':...}, ...]",
+    )
+    parser.add_argument(
+        "--two-stage-all-combos",
+        action="store_true",
+        help="Enumerate all ordered 2-stage combos (subject to distinctness flags).",
+    )
+    parser.add_argument(
+        "--per-combo-success",
+        type=int,
+        default=0,
+        help="If >0 in two-stage mode, save this many successful demos per 2-stage combo into subfolders.",
+    )
+    parser.add_argument(
+        "--two-stage-max-combos",
+        type=int,
+        default=0,
+        help="Optional cap on the number of 2-stage combos to run (after loading/enumeration). 0 = no cap.",
+    )
+    parser.add_argument(
+        "--allow-same-object",
+        action="store_true",
+        help="Allow obj0 == obj1 in 2-stage combos (default: require distinct objects).",
+    )
+    parser.add_argument(
+        "--allow-same-container",
+        action="store_true",
+        help="Allow cont0 == cont1 in 2-stage combos (default: require distinct containers).",
     )
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel environments")
     parser.add_argument("--horizon", type=int, default=220, help="Max steps per episode")
@@ -1906,7 +2163,7 @@ def main():
     run_id = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out_dir) / f"gen_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    demos_dir = out_dir / ("task" if int(args.per_task_success) > 0 else "demos")
+    demos_dir = out_dir / ("task" if (int(args.per_task_success) > 0 or int(args.per_combo_success) > 0) else "demos")
     demos_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = (out_dir / "videos") if args.max_videos > 0 else None
 
@@ -1915,20 +2172,57 @@ def main():
 
     task_arg = str(args.task).strip().lower()
     tasks_to_run = None
-    if task_arg:
-        if task_arg not in [t.lower() for t in ALL_TASKS]:
-            raise ValueError(
-                f"--task not recognized: {args.task!r}\n"
-                f"Expected one of: {ALL_TASKS}"
+    two_stage_specs: list[TwoStageTaskSpec] | None = None
+
+    if bool(args.two_stage):
+        if task_arg:
+            raise ValueError("--task is not supported with --two-stage. Use --two-stage-specs-json or --two-stage-all-combos.")
+        if int(args.per_task_success) > 0:
+            raise ValueError("--per-task-success is not supported with --two-stage. Use --per-combo-success instead.")
+
+        specs_json = str(args.two_stage_specs_json).strip()
+        if specs_json:
+            two_stage_specs = load_two_stage_specs_json(
+                specs_json,
+                object_names=OBJECT_NAMES,
+                container_names=CONTAINER_NAMES,
             )
-        # Preserve original string formatting from ALL_TASKS for stable folder names.
-        tasks_to_run = [next(t for t in ALL_TASKS if t.lower() == task_arg)]
+        elif bool(args.two_stage_all_combos):
+            two_stage_specs = enumerate_all_two_stage_combos(
+                num_objects=len(OBJECT_NAMES),
+                num_containers=len(CONTAINER_NAMES),
+                distinct_objects=not bool(args.allow_same_object),
+                distinct_containers=not bool(args.allow_same_container),
+            )
+        else:
+            raise ValueError(
+                "In --two-stage mode, you must provide either --two-stage-specs-json "
+                "or --two-stage-all-combos."
+            )
+
+        if not two_stage_specs:
+            raise ValueError("No two-stage combos found. Check --two-stage-specs-json or --two-stage-all-combos flags.")
+        if int(args.two_stage_max_combos) > 0:
+            two_stage_specs = list(two_stage_specs)[: int(args.two_stage_max_combos)]
+    else:
+        if int(args.per_combo_success) > 0:
+            raise ValueError("--per-combo-success requires --two-stage.")
+        if task_arg:
+            if task_arg not in [t.lower() for t in ALL_TASKS]:
+                raise ValueError(
+                    f"--task not recognized: {args.task!r}\n"
+                    f"Expected one of: {ALL_TASKS}"
+                )
+            # Preserve original string formatting from ALL_TASKS for stable folder names.
+            tasks_to_run = [next(t for t in ALL_TASKS if t.lower() == task_arg)]
 
     info = generate_dataset(
         env,
         n_success_episodes=args.n_success,
         per_task_success=int(args.per_task_success),
         tasks_to_run=tasks_to_run,
+        two_stage_specs=two_stage_specs,
+        per_combo_success=int(args.per_combo_success),
         horizon=args.horizon,
         demos_dir=demos_dir,
         planner_params=PickPlaceParams(

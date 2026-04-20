@@ -3,6 +3,7 @@ import numpy as np
 from CG_L2_image_wrapper import (
     _all_tasks_for_level,
     _infer_task_level_from_env,
+    _numpy_seed_scope,
     _transform_to_relative,
 )
 
@@ -34,28 +35,41 @@ class StateBasedCGWrapper:
     # Core interface
     # ------------------------------------------------------------------
 
-    def reset(self, **kwargs):
+    def reset(
+        self,
+        *,
+        tasks: list[str] | None = None,
+        reset_seeds: list[int] | None = None,
+        **kwargs,
+    ):
         kwargs.pop("seed", None)
         self.obs = []
+        if tasks is not None and len(tasks) != self.num_envs:
+            raise ValueError(f"tasks must have length {self.num_envs}, got {len(tasks)}")
+        if reset_seeds is not None and len(reset_seeds) != self.num_envs:
+            raise ValueError(f"reset_seeds must have length {self.num_envs}, got {len(reset_seeds)}")
 
         for i, env in enumerate(self.envs):
-            level = _infer_task_level_from_env(env)
+            with _numpy_seed_scope(None if reset_seeds is None else reset_seeds[i]):
+                level = _infer_task_level_from_env(env)
 
-            if isinstance(self.train_task, (list, tuple)) and self.train_task:
-                task_str = str(np.random.choice(list(self.train_task)))
-            elif isinstance(self.train_task, str) and self.train_task and self.train_task.lower() != "all":
-                task_str = str(self.train_task)
-            else:
-                task_str = str(np.random.choice(_all_tasks_for_level(level)))
+                if tasks is not None:
+                    task_str = str(tasks[i])
+                elif isinstance(self.train_task, (list, tuple)) and self.train_task:
+                    task_str = str(np.random.choice(list(self.train_task)))
+                elif isinstance(self.train_task, str) and self.train_task and self.train_task.lower() != "all":
+                    task_str = str(self.train_task)
+                else:
+                    task_str = str(np.random.choice(_all_tasks_for_level(level)))
 
-            if hasattr(env, "update_task") and callable(env.update_task):
-                env.update_task(task_str)
-            else:
-                env.task = task_str
-            if hasattr(env, "_refresh_task_pointers") and callable(env._refresh_task_pointers):
-                env._refresh_task_pointers()
+                if hasattr(env, "update_task") and callable(env.update_task):
+                    env.update_task(task_str)
+                else:
+                    env.task = task_str
+                if hasattr(env, "_refresh_task_pointers") and callable(env._refresh_task_pointers):
+                    env._refresh_task_pointers()
 
-            obs_i = env.reset(**kwargs)
+                obs_i = env.reset(**kwargs)
             self.obs.append(obs_i)
             self.step_counter[i] = 0
 

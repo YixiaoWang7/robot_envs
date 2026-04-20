@@ -1,12 +1,12 @@
 {
   "eval_config": {
-    "checkpoint": "/home/yixiao/Documents/code/robopolicy/runs/l4_single_stage_longer_larger_full/checkpoints/ckpt_step_0100000.pt",
+    "checkpoint": "/home/yixiao/Documents/code/robopolicy/runs/l4_1s_bs128/checkpoints/ckpt_step_0045000.pt",
     "n_episodes": 200,
     "num_envs": 8,
     "horizon": 300,
     "n_execute": 8,
     "max_videos": 10,
-    "seed": 777,
+    "seed": 45656,
     "out_dir": "artifacts"
   },
   "tasks": [
