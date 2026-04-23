@@ -110,6 +110,14 @@ python eval_policy_l4.py --config eval_config.json --n-episodes 200 --seed 42
 
 python tests/eval_policy_l4.py --config tests/test_configs/full.json --checkpoint /home/yixiao/Documents/code/robopolicy/runs/l4_1s_bs128/checkpoints/ckpt_step_0100000.pt
 
+python tests/eval_policy_l4.py --config tests/test_configs/diag_mid_train.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_mid_transformer_cross_seed0/checkpoints/ckpt_final.pt ; python tests/eval_policy_l4.py --config tests/test_configs/diag_mid_eval.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_mid_transformer_cross_seed0/checkpoints/ckpt_final.pt
+
+python tests/eval_policy_l4.py --config tests/test_configs/diag_eval.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_transformer_cross_seed0/checkpoints/ckpt_final.pt ; python tests/eval_policy_l4.py --config tests/test_configs/diag_train.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_transformer_cross_seed0/checkpoints/ckpt_final.pt
+
+# to do
+python tests/eval_policy_l4.py --config tests/test_configs/diag_cor_eval.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_cor_transformer_cross_seed0/checkpoints/ckpt_final.pt ; python tests/eval_policy_l4.py --config tests/test_configs/diag_cor_train.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_diag_cor_transformer_cross_seed0/checkpoints/ckpt_final.pt
+
+python tests/eval_policy_l4.py --config tests/test_configs/L_mid_eval.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_L_mid_transformer_cross_seed0/checkpoints/ckpt_final.pt ; python tests/eval_policy_l4.py --config tests/test_configs/L_mid_train.json --checkpoint /mnt/ssd1/yixiao/cg/ckpt/l4_1s_L_mid_transformer_cross_seed0/checkpoints/ckpt_final.pt
 
 python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 213 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 763 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 7  
 

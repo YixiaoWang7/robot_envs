@@ -1,0 +1,30 @@
+{
+  "eval_config": {
+    "checkpoint": "PATH/TO/YOUR_CHECKPOINT.pt",
+    "device": "cuda",
+    "n_trials_per_task": 5,
+    "num_envs": 8,
+    "horizon": 300,
+    "n_execute": 8,
+    "max_videos": 10,
+    "seed": 22,
+    "out_dir": "artifacts"
+  },
+  "result_config": {
+    "save_rollouts": true,
+    "save_videos": true,
+    "save_per_episode_details": true,
+    "save_per_task_breakdown": true,
+    "include_action_statistics": true,
+    "include_reward_statistics": true
+  },
+  "train_tasks": [
+    "place the cross into the bin",
+    "place the cross into the mug",
+    "place the cross into the plate",
+    "place the cross into the mug_no_handle",
+    "place the cube into the bin",
+    "place the cylinder into the bin",
+    "place the milk into the bin"
+  ]
+}

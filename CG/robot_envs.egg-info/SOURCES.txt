@@ -7,3 +7,4 @@ CG/robot_envs.egg-info/SOURCES.txt
 CG/robot_envs.egg-info/dependency_links.txt
 CG/robot_envs.egg-info/requires.txt
 CG/robot_envs.egg-info/top_level.txt
+tests/test_motion_planner.py

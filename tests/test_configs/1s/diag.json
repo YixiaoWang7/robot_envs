@@ -1,8 +1,8 @@
 {
   "eval_config": {
-    "checkpoint": "/home/yixiao/Documents/code/robopolicy/runs/l4_single_stage_longer/checkpoints/ckpt_step_0100000.pt",
+    "checkpoint": "PATH/TO/YOUR_CHECKPOINT.pt",
     "device": "cuda",
-    "n_episodes": 200,
+    "n_trials_per_task": 5,
     "num_envs": 8,
     "horizon": 300,
     "n_execute": 8,
@@ -10,9 +10,6 @@
     "seed": 22,
     "out_dir": "artifacts"
   },
-  "tasks": [
-    "place the cross into the mug_no_handle"
-  ],
   "result_config": {
     "save_rollouts": true,
     "save_videos": true,
@@ -20,5 +17,11 @@
     "save_per_task_breakdown": true,
     "include_action_statistics": true,
     "include_reward_statistics": true
-  }
+  },
+  "train_tasks": [
+    "place the cross into the bin",
+    "place the cube into the mug",
+    "place the cylinder into the plate",
+    "place the milk into the mug_no_handle"
+  ]
 }

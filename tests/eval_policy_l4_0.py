@@ -91,166 +91,15 @@ def _set_torch_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
-def _build_episode_tasks_full_grid(*, n_trials_per_task: int) -> list[str]:
-    """
-    Deterministic evaluation schedule: full 4×4 task grid, repeated N times.
-
-    Order is stable across runs to make comparisons easier:
-      objects major, containers minor (same as `_ALL_TASKS`).
-    """
-    n = int(n_trials_per_task)
-    if n <= 0:
-        raise ValueError(f"n_trials_per_task must be > 0, got {n_trials_per_task}")
-    return [task for task in _ALL_TASKS for _ in range(n)]
-
-
-def _load_tasks_from_config(path: str | None) -> list[str]:
-    if not path:
-        return []
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Task config not found: {p}")
-    with p.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    tasks = cfg.get("tasks", [])
-    if not isinstance(tasks, list):
-        raise ValueError(f"Invalid tasks list in {p}: expected list, got {type(tasks)}")
-    return [str(t) for t in tasks]
-
-
-def _interpolate_rgb(c0: tuple[int, int, int], c1: tuple[int, int, int], t: float) -> tuple[int, int, int]:
-    tt = float(np.clip(t, 0.0, 1.0))
-    return (
-        int(round(c0[0] + (c1[0] - c0[0]) * tt)),
-        int(round(c0[1] + (c1[1] - c0[1]) * tt)),
-        int(round(c0[2] + (c1[2] - c0[2]) * tt)),
-    )
-
-
-def _save_success_grid_image(
-    *,
-    out_path: Path,
-    per_task: dict[str, dict],
-    train_tasks: set[str],
-) -> None:
-    """
-    Save a 4×4 success-rate grid image (objects × containers).
-
-    Cell color encodes success rate within each group:
-      Train tasks  — blue  scale (soft periwinkle → sky blue)
-      Eval tasks   — amber scale (soft peach      → warm amber)
-      Missing data — neutral gray
-    """
-    try:
-        from PIL import Image, ImageDraw, ImageFont  # type: ignore
-    except Exception as e:
-        raise RuntimeError("PIL (Pillow) is required to save the task grid image") from e
-
-    def _load_nice_font(size: int) -> "ImageFont.ImageFont":
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(size))
-        except Exception:
-            return ImageFont.load_default()
-
-    cell = 140
-    pad = 22
-    left_label_w = 110
-    top_label_h = 62
-    gap = 4           # white gap between cells — no hard borders
-    bg = (250, 250, 248)  # warm white background
-    w = pad * 2 + left_label_w + cell * 4
-    h = pad * 2 + top_label_h + cell * 4
-    img = Image.new("RGB", (w, h), bg)
-    draw = ImageDraw.Draw(img)
-
-    label_font = _load_nice_font(16)
-    value_font = _load_nice_font(15)
-
-    x0 = pad + left_label_w
-    y0 = pad + top_label_h
-
-    # Light scientific palettes — lo is a visible tint so 0% cells still show their group color.
-    # Train:  soft periwinkle-blue  →  clear sky blue
-    train_lo = (207, 230, 252)   # clearly blue, even at 0%
-    train_hi = (100, 181, 246)   # Material Blue 300
-    # Eval:   soft warm peach      →  warm amber
-    eval_lo  = (255, 226, 154)   # clearly amber, even at 0%
-    eval_hi  = (255, 152, 0)     # Material Amber 600 (a touch richer at top)
-    missing  = (225, 225, 225)   # neutral gray for truly missing data
-
-    cont_display = {"mug_no_handle": "mug\n(no handle)"}
-
-    # Column labels (containers)
-    for ci, cont in enumerate(_L4_CONTAINERS):
-        x1 = x0 + ci * cell
-        label = cont_display.get(cont, cont)
-        if hasattr(draw, "multiline_textbbox"):
-            tb = draw.multiline_textbbox((0, 0), label, font=label_font, spacing=2, align="center")  # type: ignore[attr-defined]
-            tw = tb[2] - tb[0]
-            th = tb[3] - tb[1]
-        else:
-            lines = label.splitlines() or [label]
-            line_bbs = [draw.textbbox((0, 0), ln, font=label_font) for ln in lines]
-            line_ws = [bb[2] - bb[0] for bb in line_bbs]
-            line_hs = [bb[3] - bb[1] for bb in line_bbs]
-            tw = max(line_ws) if line_ws else 0
-            th = sum(line_hs) + max(0, (len(lines) - 1)) * 2
-        draw.multiline_text(
-            (x1 + (cell - tw) / 2, pad + (top_label_h - th) / 2),
-            label,
-            fill=(80, 80, 80),
-            font=label_font,
-            spacing=2,
-            align="center",
-        )
-
-    for oi, obj in enumerate(_L4_OBJECTS):
-        y1 = y0 + oi * cell
-        ob = draw.textbbox((0, 0), f"{obj}", font=label_font)
-        ow = ob[2] - ob[0]
-        oh = ob[3] - ob[1]
-        draw.text(
-            (pad + (left_label_w - ow) / 2, y1 + (cell - oh) / 2),
-            f"{obj}",
-            fill=(80, 80, 80),
-            font=label_font,
-        )
-        for ci, cont in enumerate(_L4_CONTAINERS):
-            task = f"place the {obj} into the {cont}"
-            stats = per_task.get(task)
-            if stats is None:
-                fill = missing
-                text = "-"
-            else:
-                sr = float(stats.get("pc_success", 0.0)) / 100.0
-                text = f"{float(stats.get('pc_success', 0.0)):.1f}%"
-                is_train = task in train_tasks
-                if is_train:
-                    fill = _interpolate_rgb(train_lo, train_hi, sr)
-                else:
-                    fill = _interpolate_rgb(eval_lo, eval_hi, sr)
-
-            x1 = x0 + ci * cell
-            y1 = y0 + oi * cell
-            x2 = x1 + cell
-            y2 = y1 + cell
-
-            # No per-cell border; use a subtle white gap instead.
-            draw.rectangle([x1 + gap, y1 + gap, x2 - gap, y2 - gap], fill=fill)
-
-            # Center text
-            vb = draw.textbbox((0, 0), text, font=value_font)
-            tw = vb[2] - vb[0]
-            th = vb[3] - vb[1]
-            draw.text(
-                (x1 + (cell - tw) / 2, y1 + (cell - th) / 2),
-                text,
-                fill=(60, 60, 60),
-                font=value_font,
-            )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(out_path))
+def _sample_episode_tasks(eval_tasks: list[str], task_seeds: list[int]) -> list[str]:
+    allow_list = [str(t) for t in eval_tasks]
+    if not allow_list:
+        raise ValueError("eval_tasks must not be empty")
+    sampled: list[str] = []
+    for seed in task_seeds:
+        rng = np.random.default_rng(int(seed))
+        sampled.append(str(rng.choice(allow_list)))
+    return sampled
 
 
 # ---------------------------------------------------------------------------
@@ -316,10 +165,25 @@ def _preprocess_images(obs: dict, env_idx: int) -> np.ndarray:
         obs["observation.images.robot0_eye_in_hand"][env_idx],
     ]
     out = []
-    for im in cams:
+    cam_names = ["agentview", "robot0_eye_in_hand"]
+    debug_image = False
+    for cam_name, im in zip(cam_names, cams):
         im = im.astype(np.uint8)
         im_bgr = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
         out.append(np.transpose(im_bgr, (2, 0, 1)))  # (3, H, W) uint8
+
+        # Save debug images for the first call (env_idx == 0) only.
+        if debug_image and env_idx == 0:
+            import os
+            from PIL import Image as _PIL
+            debug_dir = "debug_preprocess"
+            os.makedirs(debug_dir, exist_ok=True)
+            # Save raw RGB via PIL — correct colors if the wrapper outputs proper RGB.
+            _PIL.fromarray(im).save(f"{debug_dir}/{cam_name}_rgb.png")
+            # Save the BGR version via PIL — colors will look swapped (R↔B) if conversion is correct.
+            _PIL.fromarray(im_bgr).save(f"{debug_dir}/{cam_name}_bgr.png")
+    
+        
     return np.stack(out, axis=0)  # (n_cams, 3, H, W) uint8
 
 
@@ -463,6 +327,8 @@ def run_batch(
     task_idx_tensors = []
     for i in range(num_envs):
         obj_i, cont_i = _parse_task_indices(tasks[i])
+        print(tasks[i])
+        print(obj_i, cont_i)
         task_idx_tensors.append(torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device))
 
     state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
@@ -528,6 +394,7 @@ def run_batch(
                 model_kwargs["env_state"] = norm_batch["env_state"]
             if use_images:
                 model_kwargs["images"] = images_batch
+            # print(model_kwargs)
             with torch.no_grad():
                 _set_torch_seed(int(policy_rng.integers(0, np.iinfo(np.int32).max, dtype=np.int64)))
                 actions_norm = policy.model.generate_actions(**model_kwargs)
@@ -543,6 +410,7 @@ def run_batch(
             if not done[i] and action_queues[i]:
                 action_mat[i] = action_queues[i].pop(0)
 
+        # time.sleep(0.1)
         obs, rew, terminated, truncated, info = env.step(action_mat.astype(np.float32))
         successes = np.asarray(info.get("is_success", [False] * num_envs))
 
@@ -615,13 +483,15 @@ def eval_policy(
     env: ImageBasedCGWrapper,
     policy,
     *,
-    episode_tasks: list[str],
+    n_episodes: int,
     horizon: int,
     n_execute: int,
     device: str,
     fps: int,
     out_dir: Path,
     max_videos: int,
+    seed: int,
+    eval_tasks: list[str],
     result_config: dict,
     seed_plan: EvalSeedPlan,
 ) -> dict:
@@ -629,13 +499,14 @@ def eval_policy(
     Run ceil(n_episodes / num_envs) batched rollouts and aggregate metrics.
     Returns the full info dict (also written to eval_summary.json).
     """
-    n_episodes = len(episode_tasks)
     num_envs   = env.num_envs
     n_batches  = math.ceil(n_episodes / num_envs)
     videos_dir = out_dir / "videos"
     rollouts_dir = out_dir / "rollouts"
     videos_dir.mkdir(parents=True, exist_ok=True)
     rollouts_dir.mkdir(parents=True, exist_ok=True)
+    episode_tasks = _sample_episode_tasks(eval_tasks, seed_plan.episode_task_seeds)
+
     all_episodes: list[dict] = []
     n_episodes_rendered = 0
     start_time = time.time()
@@ -815,19 +686,14 @@ def main():
         description="Multi-episode policy evaluation on CG_L4",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to JSON eval config file")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to JSON config file (if provided, other args are optional)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to .pt checkpoint")
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument(
-        "--n-trials-per-task",
-        "--n_trials_per_task",
-        dest="n_trials_per_task",
-        type=int,
-        default=None,
-        help="Override eval_config.n_trials_per_task from the config JSON",
-    )
+    # Evaluation scale
+    parser.add_argument("--n-episodes", type=int, default=None,
+                        help="Total number of episodes to evaluate")
     parser.add_argument("--num-envs", type=int, default=None,
                         help="Parallel environments per batch (must be even)")
     parser.add_argument("--horizon", type=int, default=None,
@@ -835,6 +701,9 @@ def main():
     # Policy
     parser.add_argument("--n-execute", type=int, default=None,
                         help="Actions to execute per policy query (MPC horizon)")
+    # Environment
+    parser.add_argument("--task", type=str, default=None,
+                        help='Task string or "all" for the wrapper to sample tasks')
     # Output
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-videos", type=int, default=None,
@@ -842,59 +711,80 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     
-    config = load_config(args.config)
-    eval_config = config.get("eval_config", {})
-    result_config = config.get("result_config", {})
-
-    # Optional: use a train task config to color the 4×4 grid patches.
-    train_tasks_cfg_path = config.get("train_tasks_config", None)
-    train_tasks_list = config.get("train_tasks", None)
-    if train_tasks_list is not None:
-        if not isinstance(train_tasks_list, list):
-            raise ValueError(f"train_tasks must be a list, got {type(train_tasks_list)}")
-        train_tasks = {str(t) for t in train_tasks_list}
+    # Load config file if provided
+    if args.config:
+        config = load_config(args.config)
+        eval_config = config.get("eval_config", {})
+        tasks = config.get("tasks", _ALL_TASKS)
+        result_config = config.get("result_config", {})
+        
+        # Override with command line args if provided
+        checkpoint = args.checkpoint or eval_config.get("checkpoint")
+        device = args.device or eval_config.get("device", "cuda")
+        n_episodes = args.n_episodes if args.n_episodes is not None else eval_config.get("n_episodes", 50)
+        num_envs = args.num_envs if args.num_envs is not None else eval_config.get("num_envs", 2)
+        horizon = args.horizon if args.horizon is not None else eval_config.get("horizon", 200)
+        n_execute = args.n_execute if args.n_execute is not None else eval_config.get("n_execute", 8)
+        out_dir = args.out_dir or eval_config.get("out_dir", "artifacts")
+        max_videos = args.max_videos if args.max_videos is not None else eval_config.get("max_videos", 10)
+        seed = args.seed if args.seed is not None else eval_config.get("seed", 0)
+        task = args.task or eval_config.get("task", "all")
     else:
-        train_tasks = set(_load_tasks_from_config(train_tasks_cfg_path))
-
-    checkpoint = args.checkpoint or eval_config.get("checkpoint")
-    device = args.device or eval_config.get("device", "cuda")
-    num_envs = args.num_envs if args.num_envs is not None else eval_config.get("num_envs", 2)
-    horizon = args.horizon if args.horizon is not None else eval_config.get("horizon", 200)
-    n_execute = args.n_execute if args.n_execute is not None else eval_config.get("n_execute", 8)
-    out_dir = args.out_dir or eval_config.get("out_dir", "artifacts")
-    max_videos = args.max_videos if args.max_videos is not None else eval_config.get("max_videos", 10)
-    seed = args.seed if args.seed is not None else eval_config.get("seed", 0)
-
-    if not checkpoint:
-        raise ValueError("eval_config.checkpoint (or --checkpoint) is required")
-
-    n_trials_per_task = args.n_trials_per_task if args.n_trials_per_task is not None else eval_config.get("n_trials_per_task")
-    if n_trials_per_task is None:
-        raise ValueError("eval_config.n_trials_per_task is required — total episodes = n_trials_per_task × 16 tasks")
-    episode_tasks = _build_episode_tasks_full_grid(n_trials_per_task=int(n_trials_per_task))
-    n_episodes = len(episode_tasks)
+        # Use command line args only
+        if not args.checkpoint:
+            parser.error("--checkpoint is required when --config is not provided")
+        
+        checkpoint = args.checkpoint
+        device = args.device or "cuda"
+        n_episodes = args.n_episodes if args.n_episodes is not None else 50
+        num_envs = args.num_envs if args.num_envs is not None else 2
+        horizon = args.horizon if args.horizon is not None else 200
+        n_execute = args.n_execute if args.n_execute is not None else 8
+        out_dir = args.out_dir or "artifacts"
+        max_videos = args.max_videos if args.max_videos is not None else 10
+        seed = args.seed if args.seed is not None else 0
+        task = args.task or "all"
+        tasks = _ALL_TASKS
+        result_config = {
+            "save_rollouts": True,
+            "save_videos": True,
+            "save_per_episode_details": True,
+            "save_per_task_breakdown": True,
+            "include_action_statistics": True,
+            "include_reward_statistics": True,
+        }
 
     os.environ.setdefault("MUJOCO_GL", "egl")
     deterministic_eval = True
     seed_plan = _build_seed_plan(root_seed=seed, n_episodes=n_episodes, num_envs=num_envs)
     _set_global_seed(seed_plan.global_seed, deterministic=deterministic_eval)
 
+    # if num_envs % 2 != 0:
+    #     raise ValueError("--num-envs must be even (ImageBasedCGWrapper requirement)")
+
     policy = build_policy(
         checkpoint=Path(checkpoint),
         device=device,
     )
 
+    # Build the environment wrapper that matches the checkpoint features.
+    # For image-conditioned checkpoints, we need a concrete task string (not "all") to build the env.
+    env_task = task if policy.image_feature is None else (task if task != "all" else _ALL_TASKS[0])
     wrapper_cls = ImageBasedCGWrapper if policy.image_feature is not None else StateBasedCGWrapper
     env = wrapper_cls(
-        make_env_fn=lambda: make_env("all", horizon=horizon),
+        make_env_fn=lambda: make_env(env_task, horizon=horizon),
         num_envs=num_envs,
         use_relative_coordinates=(policy.env_state_feature is not None),
     )
+    if wrapper_cls is StateBasedCGWrapper:
+        env.train_task = "all"
+    else:
+        env.train_task = task
 
     fps = int(getattr(env.envs[0], "control_freq", 20))
     print(f"env control_freq={fps} Hz | num_envs={num_envs}")
 
-    probe_task = str(_ALL_TASKS[0])
+    probe_task = str(tasks[0] if tasks else _ALL_TASKS[0])
     probe_tasks = [probe_task for _ in range(num_envs)]
     probe_reset_seeds = [int(seed_plan.global_seed + i) for i in range(num_envs)]
     obs, _ = env.reset(tasks=probe_tasks, reset_seeds=probe_reset_seeds)
@@ -934,16 +824,14 @@ def main():
         "checkpoint": checkpoint,
         "device": device,
         "n_episodes": n_episodes,
-        "n_trials_per_task": int(n_trials_per_task),
         "num_envs": num_envs,
         "horizon": horizon,
         "n_execute": n_execute,
         "max_videos": max_videos,
         "seed": seed,
-        "eval_tasks": _ALL_TASKS,
+        "task": task,
+        "eval_tasks": tasks,
         "result_config": result_config,
-        "train_tasks_config": train_tasks_cfg_path,
-        "train_tasks": sorted(train_tasks),
         "reproducibility": {
             "deterministic_torch": deterministic_eval,
             "seed_plan": asdict(seed_plan),
@@ -957,13 +845,15 @@ def main():
     info = eval_policy(
         env,
         policy,
-        episode_tasks=episode_tasks,
+        n_episodes=n_episodes,
         horizon=horizon,
         n_execute=n_execute,
         device=device,
         fps=fps,
         out_dir=out_dir_path,
         max_videos=max_videos,
+        seed=seed,
+        eval_tasks=tasks,
         result_config=result_config,
         seed_plan=seed_plan,
     )
@@ -988,18 +878,6 @@ def main():
                 print(f"    {'':40s}  avg_rew={stats['avg_sum_reward']:.3f} ± {stats['std_sum_reward']:.3f}")
             if result_config.get("include_action_statistics", True):
                 print(f"    {'':40s}  avg_len={stats['avg_length']:.1f} ± {stats['std_length']:.1f}")
-
-        # Save 4×4 success-rate grid image (train vs eval bordered).
-        try:
-            grid_path = out_dir_path / "task_grid_success.png"
-            _save_success_grid_image(
-                out_path=grid_path,
-                per_task=info["per_task"],
-                train_tasks=train_tasks,
-            )
-            print(f"\nSaved task grid image: {grid_path}")
-        except Exception as e:
-            print(f"\n[warn] Could not save task grid image: {e}")
     print("=" * 60)
     print(f"Full results: {out_dir_path / 'eval_summary.json'}")
 
