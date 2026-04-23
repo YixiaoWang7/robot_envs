@@ -169,14 +169,21 @@ def _save_success_grid_image(
     x0 = pad + left_label_w
     y0 = pad + top_label_h
 
-    # Light scientific palettes — lo is a visible tint so 0% cells still show their group color.
-    # Train:  soft periwinkle-blue  →  clear sky blue
-    train_lo = (207, 230, 252)   # clearly blue, even at 0%
-    train_hi = (100, 181, 246)   # Material Blue 300
-    # Eval:   soft warm peach      →  warm amber
-    eval_lo  = (255, 226, 154)   # clearly amber, even at 0%
-    eval_hi  = (255, 152, 0)     # Material Amber 600 (a touch richer at top)
+    # Palettes — moderate contrast so 0% and 100% are distinct but not harsh.
+    # Train: soft periwinkle-blue → clear sky blue
+    train_lo = (214, 234, 252)
+    train_hi = ( 66, 165, 245)   # Material Blue 400
+    # Eval:  soft peach          → warm amber
+    eval_lo  = (255, 232, 186)
+    eval_hi  = (255, 167,  38)   # Material Orange 400
     missing  = (225, 225, 225)   # neutral gray for truly missing data
+
+    def _text_fill_for_bg(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+        # W3C-ish relative luminance; choose white text on dark cells for contrast.
+        r, g, b = [c / 255.0 for c in rgb]
+        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        # Keep the overall look light; only flip to white on genuinely dark fills.
+        return (250, 250, 250) if lum < 0.42 else (60, 60, 60)
 
     cont_display = {"mug_no_handle": "mug\n(no handle)"}
 
@@ -221,6 +228,7 @@ def _save_success_grid_image(
             if stats is None:
                 fill = missing
                 text = "-"
+                text_fill = (110, 110, 110)
             else:
                 sr = float(stats.get("pc_success", 0.0)) / 100.0
                 text = f"{float(stats.get('pc_success', 0.0)):.1f}%"
@@ -229,6 +237,7 @@ def _save_success_grid_image(
                     fill = _interpolate_rgb(train_lo, train_hi, sr)
                 else:
                     fill = _interpolate_rgb(eval_lo, eval_hi, sr)
+                text_fill = _text_fill_for_bg(fill)
 
             x1 = x0 + ci * cell
             y1 = y0 + oi * cell
@@ -245,7 +254,7 @@ def _save_success_grid_image(
             draw.text(
                 (x1 + (cell - tw) / 2, y1 + (cell - th) / 2),
                 text,
-                fill=(60, 60, 60),
+                fill=text_fill,
                 font=value_font,
             )
 
