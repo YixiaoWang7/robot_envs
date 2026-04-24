@@ -1,0 +1,31 @@
+{
+  "eval_config": {
+    "checkpoint": "PATH/TO/YOUR_CHECKPOINT.pt",
+    "device": "cuda",
+    "n_trials_per_task": 5,
+    "num_envs": 8,
+    "horizon": 300,
+    "n_execute": 8,
+    "max_videos": 10,
+    "seed": 22,
+    "out_dir": "artifacts"
+  },
+  "result_config": {
+    "save_rollouts": true,
+    "save_videos": true,
+    "save_per_episode_details": true,
+    "save_per_task_breakdown": true,
+    "include_action_statistics": true,
+    "include_reward_statistics": true
+  },
+  "task_slugs": [],
+  "stage0_train_tasks": [],
+  "stage0_train_task_slugs": [],
+  "stage1_train_tasks": [],
+  "stage1_train_task_slugs": [],
+  "constraints": {
+    "distinct_objects": true,
+    "distinct_containers": true
+  }
+}
+
