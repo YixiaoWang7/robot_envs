@@ -6,6 +6,7 @@ Loads a RobotFlowPolicyWrapper checkpoint and runs MPC inference.
 
 Outputs (under --out-dir / eval_{timestamp}/):
   videos/ep{i:03d}_{Success|Failure}_{task}.mp4   (up to --max-videos)
+  cross_attn_videos/ep{i:03d}_{Success|Failure}_{task}_crossattn.mp4   (optional)
   rollouts/ep{i:03d}.npz                           (actions, rewards, success)
   eval_summary.json                                 (aggregated + per-episode + per-task metrics)
 """
@@ -290,6 +291,147 @@ def _make_video_writer(path: Path, fps: int):
 
 
 # ---------------------------------------------------------------------------
+# Cross-attention visualization
+# ---------------------------------------------------------------------------
+
+def _overlay_attn_on_rgb(
+    rgb_u8: np.ndarray,
+    attn_hw: np.ndarray,
+    *,
+    alpha: float = 0.45,
+    colormap: int | None = None,
+) -> np.ndarray:
+    """
+    Overlay an attention heatmap on an RGB uint8 image.
+
+    - rgb_u8: (H,W,3) RGB uint8
+    - attn_hw: (Hf,Wf) float (any range); normalized per-frame
+    """
+    import cv2  # type: ignore
+
+    if rgb_u8.ndim != 3 or rgb_u8.shape[-1] != 3:
+        raise ValueError(f"Expected rgb_u8 shape (H,W,3), got {tuple(rgb_u8.shape)}")
+
+    H, W = int(rgb_u8.shape[0]), int(rgb_u8.shape[1])
+    a = attn_hw.astype(np.float32)
+    a = a - float(np.min(a))
+    denom = float(np.max(a))
+    if denom > 1e-8:
+        a = a / denom
+    else:
+        a = np.zeros_like(a, dtype=np.float32)
+
+    heat = cv2.resize(a, (W, H), interpolation=cv2.INTER_CUBIC)  # (H,W)
+    heat_u8 = np.clip(heat * 255.0, 0, 255).astype(np.uint8)
+    cmap = int(colormap) if colormap is not None else int(cv2.COLORMAP_TURBO)
+    heat_bgr = cv2.applyColorMap(heat_u8, cmap)  # (H,W,3) BGR
+    heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+    out = (rgb_u8.astype(np.float32) * (1.0 - float(alpha))) + (heat_rgb.astype(np.float32) * float(alpha))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _render_cross_attn_frame(
+    *,
+    obs: dict,
+    env_idx: int,
+    attn_last_step: np.ndarray,
+    step: int,
+) -> np.ndarray:
+    """
+    Render a single RGB frame:
+      rows = cameras (agentview, eye_in_hand)
+      cols = [raw, obj_query_overlay, cont_query_overlay]
+
+    - attn_last_step: (Nc, Tq=2, Hf, Wf)
+    """
+    import cv2  # type: ignore
+
+    cam_keys = [
+        "observation.images.agentview",
+        "observation.images.robot0_eye_in_hand",
+    ]
+    imgs = []
+    for k in cam_keys:
+        if k in obs:
+            imgs.append(obs[k][env_idx].astype(np.uint8))  # RGB (H,W,3)
+    if not imgs:
+        # Fallback: still return something with the same writer contract.
+        return obs["observation.images.agentview"][env_idx].astype(np.uint8)
+
+    Nc = int(attn_last_step.shape[0])
+    if Nc != len(imgs):
+        # Best-effort: clip to the smaller count.
+        n = min(Nc, len(imgs))
+        imgs = imgs[:n]
+        attn_last_step = attn_last_step[:n]
+
+    rows = []
+    for cam_i, rgb in enumerate(imgs):
+        a_obj = attn_last_step[cam_i, 0]  # (Hf,Wf)
+        a_cont = attn_last_step[cam_i, 1]  # (Hf,Wf)
+        ov_obj = _overlay_attn_on_rgb(rgb, a_obj)
+        ov_cont = _overlay_attn_on_rgb(rgb, a_cont)
+
+        # Add lightweight labels (draw on copies).
+        def _label(im: np.ndarray, text: str) -> np.ndarray:
+            out = im.copy()
+            cv2.putText(
+                out,
+                text,
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                text,
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+            return out
+
+        cam_name = "agentview" if cam_i == 0 else f"cam{cam_i}"
+        if cam_i == 1:
+            cam_name = "eye_in_hand"
+
+        p0 = _label(rgb, f"{cam_name} | raw")
+        p1 = _label(ov_obj, f"{cam_name} | obj query")
+        p2 = _label(ov_cont, f"{cam_name} | cont query")
+        rows.append(np.concatenate([p0, p1, p2], axis=1))
+
+    frame = np.concatenate(rows, axis=0) if len(rows) > 1 else rows[0]
+    cv2.putText(
+        frame,
+        f"step {int(step)}",
+        (8, frame.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        lineType=cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"step {int(step)}",
+        (8, frame.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0),
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    return frame.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
 # Task helpers
 # ---------------------------------------------------------------------------
 
@@ -430,8 +572,10 @@ def run_batch(
     n_execute: int,
     device: str,
     record_video: bool,
+    record_cross_attn_video: bool,
     fps: int,
     video_paths: list[Path],
+    cross_attn_video_paths: list[Path],
     episode_offset: int,
     episode_tasks: list[str],
     reset_seeds: list[int],
@@ -454,20 +598,40 @@ def run_batch(
     max_rewards = [-1e9] * num_envs
     lengths = [0] * num_envs
     tasks = [getattr(env.envs[i], "task", "unknown") for i in range(num_envs)]
-    ep_frames = [[] for _ in range(num_envs)]
     ep_actions = [[] for _ in range(num_envs)]
     ep_rewards = [[] for _ in range(num_envs)]
     ep_success = [False] * num_envs
 
+    # Stream videos to disk to avoid keeping all frames in RAM.
+    video_append = [None for _ in range(num_envs)]
+    video_close = [None for _ in range(num_envs)]
     if record_video:
         for i in range(num_envs):
-            ep_frames[i].append(_get_video_frame(env, obs, i))
+            a, c = _make_video_writer(video_paths[i], fps)
+            video_append[i] = a
+            video_close[i] = c
+            video_append[i](_get_video_frame(env, obs, i))  # type: ignore[misc]
 
     import torch  # type: ignore
 
     use_images = policy.image_feature is not None
     use_env_state = policy.env_state_feature is not None
     n_obs_steps = int(policy.state_feature.window_size)
+
+    can_cross_attn = (
+        bool(record_cross_attn_video)
+        and bool(use_images)
+        and hasattr(policy, "model")
+        and hasattr(policy.model, "get_cross_attention_maps")
+    )
+    cross_append = [None for _ in range(num_envs)]
+    cross_close = [None for _ in range(num_envs)]
+    last_cross_frame = [None for _ in range(num_envs)]
+    if can_cross_attn:
+        for i in range(num_envs):
+            a, c = _make_video_writer(cross_attn_video_paths[i], fps)
+            cross_append[i] = a
+            cross_close[i] = c
 
     task_idx_tensors = []
     for i in range(num_envs):
@@ -495,6 +659,31 @@ def run_batch(
 
     for i in range(num_envs):
         _seed_history(i)
+
+    # Seed the cross-attention video with an initial frame that matches the reset observation.
+    if can_cross_attn:
+        try:
+            robot_state_init = torch.from_numpy(
+                np.stack([np.stack(list(state_hists[i]), axis=0) for i in range(num_envs)], axis=0)
+            ).to(torch.float32).to(device)
+            images_init = torch.from_numpy(
+                np.stack([np.stack(list(img_hists[i]), axis=0) for i in range(num_envs)], axis=0)
+            ).to(torch.uint8).to(device)
+            task_idx_init = torch.cat(task_idx_tensors, dim=0)
+            with torch.no_grad():
+                attn = policy.model.get_cross_attention_maps(
+                    robot_state=robot_state_init,
+                    images=images_init,
+                    task_indices=task_idx_init,
+                )["query_attn"].detach().cpu().numpy()  # (B,n_obs_steps,Nc,Tq,Hf,Wf)
+            for i in range(num_envs):
+                last = attn[i, -1]  # (Nc,Tq,Hf,Wf)
+                fr = _render_cross_attn_frame(obs=obs, env_idx=i, attn_last_step=last, step=0)
+                last_cross_frame[i] = fr
+                cross_append[i](fr)  # type: ignore[misc]
+        except Exception as e:
+            print(f"[warn] Cross-attention video disabled (failed initial render): {e}")
+            can_cross_attn = False
 
     step = 0
     while not all(done) and step < horizon:
@@ -542,6 +731,24 @@ def run_batch(
                 actions_norm = policy.model.generate_actions(**model_kwargs)
                 actions_denorm = policy.denormalize_actions(actions_norm)
 
+            # Update cross-attention frames at replan/query points.
+            if can_cross_attn:
+                try:
+                    with torch.no_grad():
+                        attn = policy.model.get_cross_attention_maps(
+                            robot_state=norm_batch["state"],
+                            images=images_batch,  # type: ignore[arg-type]
+                            task_indices=task_idx_batch,
+                        )["query_attn"].detach().cpu().numpy()  # (Bq,n_obs_steps,Nc,Tq,Hf,Wf)
+                    for qi, i in enumerate(need_query):
+                        last = attn[qi, -1]  # (Nc,Tq,Hf,Wf)
+                        last_cross_frame[i] = _render_cross_attn_frame(
+                            obs=obs, env_idx=i, attn_last_step=last, step=step
+                        )
+                except Exception as e:
+                    print(f"[warn] Cross-attention render failed at step={step} (disabling): {e}")
+                    can_cross_attn = False
+
             acts_np = actions_denorm[:, :n_execute].detach().cpu().numpy()
             for qi, i in enumerate(need_query):
                 for t in range(acts_np.shape[1]):
@@ -574,7 +781,11 @@ def run_batch(
                 done[i] = True
 
             if record_video and not done[i]:
-                ep_frames[i].append(_get_video_frame(env, obs, i))
+                video_append[i](_get_video_frame(env, obs, i))  # type: ignore[misc]
+            if can_cross_attn and not done[i]:
+                # For intermediate MPC steps, reuse the last attention map (updated on query steps).
+                if last_cross_frame[i] is not None:
+                    cross_append[i](last_cross_frame[i])  # type: ignore[misc]
 
         step += 1
         running_sr = np.mean(ep_success[:num_envs]) * 100
@@ -588,22 +799,13 @@ def run_batch(
     print()
 
     if record_video:
-        import threading
-
-        def _write_video(frames: list[np.ndarray], path: Path):
-            append, close = _make_video_writer(path, fps)
-            for f in frames:
-                append(f)
-            close()
-
-        threads = []
         for i in range(num_envs):
-            if ep_frames[i]:
-                t = threading.Thread(target=_write_video, args=(ep_frames[i], video_paths[i]))
-                t.start()
-                threads.append(t)
-        for t in threads:
-            t.join()
+            if video_close[i] is not None:
+                video_close[i]()  # type: ignore[misc]
+    if can_cross_attn:
+        for i in range(num_envs):
+            if cross_close[i] is not None:
+                cross_close[i]()  # type: ignore[misc]
 
     return {
         "success": ep_success,
@@ -631,6 +833,7 @@ def eval_policy(
     fps: int,
     out_dir: Path,
     max_videos: int,
+    max_cross_attn_videos: int,
     result_config: dict,
     seed_plan: EvalSeedPlan,
 ) -> dict:
@@ -642,12 +845,17 @@ def eval_policy(
     num_envs   = env.num_envs
     n_batches  = math.ceil(n_episodes / num_envs)
     videos_dir = out_dir / "videos"
+    cross_dir = out_dir / "cross_attn_videos"
     rollouts_dir = out_dir / "rollouts"
     videos_dir.mkdir(parents=True, exist_ok=True)
+    cross_dir.mkdir(parents=True, exist_ok=True)
     rollouts_dir.mkdir(parents=True, exist_ok=True)
     all_episodes: list[dict] = []
     n_episodes_rendered = 0
+    n_cross_rendered = 0
     start_time = time.time()
+
+    save_cross_attn = bool(result_config.get("save_cross_attention_videos", False))
 
     for batch_ix in range(n_batches):
         ep_offset = batch_ix * num_envs
@@ -659,16 +867,21 @@ def eval_policy(
         can_record = max(0, max_videos - n_episodes_rendered)
         record_this_batch = min(can_record, num_envs) > 0
 
+        can_record_cross = max(0, max_cross_attn_videos - n_cross_rendered)
+        record_cross_this_batch = save_cross_attn and (min(can_record_cross, num_envs) > 0)
+
         # Pre-build video paths
         video_paths_batch: list[Path] = []
+        cross_paths_batch: list[Path] = []
         for i in range(num_envs):
             ep_ix = ep_offset + i
             video_paths_batch.append(videos_dir / f"ep{ep_ix:03d}_PENDING.mp4")
+            cross_paths_batch.append(cross_dir / f"ep{ep_ix:03d}_PENDING_crossattn.mp4")
 
         print(
             f"\n[batch {batch_ix + 1}/{n_batches}]  "
             f"episodes {ep_offset}–{ep_offset + min(num_envs, remaining) - 1}  "
-            f"(record_video={record_this_batch})"
+            f"(record_video={record_this_batch}, record_cross_attn={record_cross_this_batch})"
         )
 
         batch_tasks = episode_tasks[ep_offset : ep_offset + num_envs]
@@ -686,8 +899,10 @@ def eval_policy(
             n_execute=n_execute,
             device=device,
             record_video=record_this_batch and (n_episodes_rendered < max_videos),
+            record_cross_attn_video=record_cross_this_batch and (n_cross_rendered < max_cross_attn_videos),
             fps=fps,
             video_paths=video_paths_batch,
+            cross_attn_video_paths=cross_paths_batch,
             episode_offset=ep_offset,
             episode_tasks=batch_tasks,
             reset_seeds=batch_reset_seeds,
@@ -698,10 +913,22 @@ def eval_policy(
         for i in range(num_envs):
             ep_ix = ep_offset + i
             if ep_ix >= n_episodes:
+                # Clean up any padded env outputs.
+                try:
+                    if video_paths_batch[i].exists():
+                        video_paths_batch[i].unlink()
+                except Exception:
+                    pass
+                try:
+                    if cross_paths_batch[i].exists():
+                        cross_paths_batch[i].unlink()
+                except Exception:
+                    pass
                 break
             success_str = "Success" if batch["success"][i] else "Failure"
             safe_task   = batch["task"][i].replace(" ", "_")
             final_path  = videos_dir / f"ep{ep_ix:03d}_{success_str}_{safe_task}.mp4"
+            final_cross = cross_dir / f"ep{ep_ix:03d}_{success_str}_{safe_task}_crossattn.mp4"
             if record_this_batch and n_episodes_rendered < max_videos:
                 video_paths_batch[i].rename(final_path)
                 n_episodes_rendered += 1
@@ -709,6 +936,24 @@ def eval_policy(
             else:
                 # Remove placeholder path (no video written)
                 video_path_str = None
+                try:
+                    if video_paths_batch[i].exists():
+                        video_paths_batch[i].unlink()
+                except Exception:
+                    pass
+
+            cross_path_str = None
+            if record_cross_this_batch and n_cross_rendered < max_cross_attn_videos:
+                if cross_paths_batch[i].exists():
+                    cross_paths_batch[i].rename(final_cross)
+                    n_cross_rendered += 1
+                    cross_path_str = str(final_cross)
+            else:
+                try:
+                    if cross_paths_batch[i].exists():
+                        cross_paths_batch[i].unlink()
+                except Exception:
+                    pass
 
             # Save per-episode rollout NPZ
             np.savez_compressed(
@@ -731,6 +976,7 @@ def eval_policy(
                 "task_seed":   int(seed_plan.episode_task_seeds[ep_ix]),
                 "policy_seed": int(batch_policy_seed),
                 "video":       video_path_str,
+                "cross_attn_video": cross_path_str,
             })
 
         # Running summary after each batch
@@ -848,6 +1094,17 @@ def main():
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-videos", type=int, default=None,
                         help="Maximum number of episode videos to save")
+    parser.add_argument(
+        "--save-cross-attn-videos",
+        action="store_true",
+        help="Save an extra per-episode MP4 with cross-attention overlays (requires an image-conditioned checkpoint)",
+    )
+    parser.add_argument(
+        "--cross-attn-max-videos",
+        type=int,
+        default=None,
+        help="Maximum number of cross-attention videos to save (defaults to --max-videos)",
+    )
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     
@@ -872,10 +1129,19 @@ def main():
     n_execute = args.n_execute if args.n_execute is not None else eval_config.get("n_execute", 8)
     out_dir = args.out_dir or eval_config.get("out_dir", "artifacts")
     max_videos = args.max_videos if args.max_videos is not None else eval_config.get("max_videos", 10)
+    max_cross_attn_videos = (
+        args.cross_attn_max_videos
+        if args.cross_attn_max_videos is not None
+        else eval_config.get("cross_attn_max_videos", max_videos)
+    )
     seed = args.seed if args.seed is not None else eval_config.get("seed", 0)
 
     if not checkpoint:
         raise ValueError("eval_config.checkpoint (or --checkpoint) is required")
+
+    if args.save_cross_attn_videos:
+        result_config = dict(result_config)
+        result_config["save_cross_attention_videos"] = True
 
     n_trials_per_task = args.n_trials_per_task if args.n_trials_per_task is not None else eval_config.get("n_trials_per_task")
     if n_trials_per_task is None:
@@ -973,6 +1239,7 @@ def main():
         fps=fps,
         out_dir=out_dir_path,
         max_videos=max_videos,
+        max_cross_attn_videos=int(max_cross_attn_videos),
         result_config=result_config,
         seed_plan=seed_plan,
     )

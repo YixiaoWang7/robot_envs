@@ -121,6 +121,8 @@ python tests/eval_policy_l4.py --config tests/test_configs/L_mid_eval.json --che
 
 python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 213 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 763 ; python tests/eval_policy_l4.py --config tests/test_configs/full.json --seed 7  
 
+python tests/eval_policy_l4.py --config tests/test_configs/1s/diag_cor.json --seed 213 --checkpoint /mnt/ssd/yixiao/cg/l4/ckpt/l4_1s_diag_cor_transformer_cross_masknone_seed3/checkpoints/ckpt_final.pt
+
 
 To generate a config from presets:
 

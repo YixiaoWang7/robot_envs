@@ -6,7 +6,7 @@
     "num_envs": 8,
     "horizon": 300,
     "n_execute": 8,
-    "max_videos": 10,
+    "max_videos": 80,
     "seed": 22,
     "out_dir": "artifacts"
   },
