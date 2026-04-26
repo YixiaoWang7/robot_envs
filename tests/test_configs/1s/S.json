@@ -7,12 +7,14 @@
     "horizon": 300,
     "n_execute": 8,
     "max_videos": 10,
+    "cross_attn_max_videos": 10,
     "seed": 22,
     "out_dir": "artifacts"
   },
   "result_config": {
     "save_rollouts": true,
     "save_videos": true,
+    "save_cross_attention_videos": false,
     "save_per_episode_details": true,
     "save_per_task_breakdown": true,
     "include_action_statistics": true,
