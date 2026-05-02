@@ -286,7 +286,22 @@ def run_batch(
 
     task_slugs = [_validate_l5_slug(t) for t in episode_tasks]
     task_strings = [_slug_to_task(slug) for slug in task_slugs]
-    obs, _ = env.reset(tasks=task_strings, reset_seeds=reset_seeds)
+
+    from robosuite.utils.errors import RandomizationError  # noqa: PLC0415
+
+    _MAX_RESET_RETRIES = 5
+    for _attempt in range(_MAX_RESET_RETRIES):
+        try:
+            obs, _ = env.reset(tasks=task_strings, reset_seeds=reset_seeds)
+            break
+        except RandomizationError:
+            if _attempt == _MAX_RESET_RETRIES - 1:
+                raise
+            reset_seeds = [s + 1 for s in reset_seeds]
+            print(
+                f"[warn] RandomizationError on reset, retrying with bumped seeds"
+                f" (attempt {_attempt + 2}/{_MAX_RESET_RETRIES})"
+            )
 
     done = [False] * num_envs
     sum_rewards = [0.0] * num_envs
@@ -296,6 +311,7 @@ def run_batch(
     ep_actions = [[] for _ in range(num_envs)]
     ep_rewards = [[] for _ in range(num_envs)]
     ep_success = [False] * num_envs
+    success_step: list[int | None] = [None] * num_envs
 
     if record_video:
         for i in range(num_envs):
@@ -403,11 +419,13 @@ def run_batch(
             ep_actions[i].append(action_mat[i].copy())
             ep_rewards[i].append(r)
             ep_success[i] = bool(info["is_success"][i])
+            if ep_success[i] and success_step[i] is None:
+                success_step[i] = step
 
             step_done = bool(terminated[i] if hasattr(terminated, "__len__") else terminated) or bool(
                 truncated[i] if hasattr(truncated, "__len__") else truncated
             )
-            if step_done or ep_success[i]:
+            if step_done or (success_step[i] is not None and step >= success_step[i] + 10):
                 done[i] = True
 
             if record_video and not done[i]:
@@ -485,9 +503,11 @@ def eval_policy(
         record_this_batch = min(can_record, num_envs) > 0
         video_paths_batch = [videos_dir / f"ep{ep_offset + i:03d}_PENDING.mp4" for i in range(num_envs)]
 
+        batch_elapsed = time.time() - start_time
         print(
             f"\n[batch {batch_ix + 1}/{n_batches}] episodes "
             f"{ep_offset}-{ep_offset + min(num_envs, remaining) - 1} (record_video={record_this_batch})"
+            f"  [{batch_elapsed:.0f}s elapsed]"
         )
         batch_tasks = episode_tasks[ep_offset : ep_offset + num_envs]
         batch_reset_seeds = seed_plan.episode_reset_seeds[ep_offset : ep_offset + num_envs]
@@ -550,10 +570,14 @@ def eval_policy(
             )
 
         done_eps = all_episodes[:n_episodes]
+        elapsed_so_far = time.time() - start_time
+        ep_per_s = len(done_eps) / max(elapsed_so_far, 1e-6)
+        eta = (n_episodes - len(done_eps)) / max(ep_per_s, 1e-6)
         print(
-            f"  -> after {len(done_eps)} episodes: "
+            f"  -> after {len(done_eps)}/{n_episodes} episodes: "
             f"SR={np.mean([e['success'] for e in done_eps]) * 100:.1f}% "
-            f"avg_len={np.mean([e['length'] for e in done_eps]):.1f}"
+            f"avg_len={np.mean([e['length'] for e in done_eps]):.1f} "
+            f"[{elapsed_so_far:.0f}s elapsed, ~{eta:.0f}s remaining]"
         )
 
     all_episodes = all_episodes[:n_episodes]
