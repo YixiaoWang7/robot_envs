@@ -714,14 +714,6 @@ def main():
     if n_trials_per_task is None:
         raise ValueError("eval_config.n_trials_per_task is required")
 
-    os.environ.setdefault("MUJOCO_GL", "egl")
-    seed_plan = _build_seed_plan(
-        root_seed=int(seed),
-        n_episodes=len(config["task_slugs"]) * int(n_trials_per_task),
-        num_envs=int(num_envs),
-    )
-    _set_global_seed(seed_plan.global_seed, deterministic=True)
-
     policy = build_policy(checkpoint=Path(checkpoint), device=device)
     train_slugs = [str(s) for s in (config.get("train_task_slugs") or config["task_slugs"])]
     train_set = set(train_slugs)
@@ -738,6 +730,14 @@ def main():
         f"CG_L5 evaluation ({eval_mode}): {len(eval_slugs)} tasks x {int(n_trials_per_task)} trials "
         f"= {len(episode_tasks)} episodes."
     )
+
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    seed_plan = _build_seed_plan(
+        root_seed=int(seed),
+        n_episodes=len(episode_tasks),
+        num_envs=int(num_envs),
+    )
+    _set_global_seed(seed_plan.global_seed, deterministic=True)
 
     t_probe = _slug_to_task(eval_slugs[0])
     env = L5ImageEvalWrapper(
