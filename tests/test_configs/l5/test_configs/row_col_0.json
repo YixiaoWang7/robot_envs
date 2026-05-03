@@ -27,5 +27,18 @@
     "cube_into_bin_press_red",
     "cylinder_into_bin_press_red",
     "milk_into_bin_press_red"
+  ],
+  "eval_all_tasks": true,
+  "train_task_slugs": [
+    "cross_into_bin_press_red",
+    "cross_into_bin_press_green",
+    "cross_into_bin_press_blue",
+    "cross_into_bin_press_yellow",
+    "cross_into_mug_press_red",
+    "cross_into_plate_press_red",
+    "cross_into_mug_no_handle_press_red",
+    "cube_into_bin_press_red",
+    "cylinder_into_bin_press_red",
+    "milk_into_bin_press_red"
   ]
 }

@@ -133,6 +133,16 @@ def _validate_l5_slug(slug: str) -> str:
     return s
 
 
+def _build_all_task_slugs() -> list[str]:
+    # Stable canonical order: objects major, containers minor, colors minor-most.
+    return [
+        f"{obj}_into_{cont}_press_{color}"
+        for obj in OBJECTS
+        for cont in CONTAINERS
+        for color in BUTTON_COLORS
+    ]
+
+
 def _preprocess_images(obs: dict, env_idx: int) -> np.ndarray:
     import cv2  # type: ignore
 
@@ -482,6 +492,7 @@ def eval_policy(
     max_videos: int,
     result_config: dict,
     seed_plan: EvalSeedPlan,
+    train_task_slugs: set[str] | None = None,
 ) -> dict:
     n_episodes = len(episode_tasks)
     num_envs = env.num_envs
@@ -627,6 +638,16 @@ def eval_policy(
         "eval_s": elapsed,
         "eval_ep_s": elapsed / max(len(all_episodes), 1),
     }
+    if train_task_slugs:
+        train_set = set(train_task_slugs)
+        id_succs = [bool(e["success"]) for e in all_episodes if str(e["task"]) in train_set]
+        ood_succs = [bool(e["success"]) for e in all_episodes if str(e["task"]) not in train_set]
+        if id_succs:
+            aggregated["pc_success_in_dist"] = float(np.mean(id_succs) * 100)
+            aggregated["n_episodes_in_dist"] = int(len(id_succs))
+        if ood_succs:
+            aggregated["pc_success_ood"] = float(np.mean(ood_succs) * 100)
+            aggregated["n_episodes_ood"] = int(len(ood_succs))
     info = {
         "aggregated": aggregated,
         "per_task": per_task if result_config.get("save_per_task_breakdown", True) else {},
@@ -643,8 +664,18 @@ def load_config(config_path: str) -> dict:
         raise ValueError("Eval config missing required keys: 'eval_config' and/or 'result_config'")
     slugs = cfg.get("task_slugs")
     if not isinstance(slugs, list) or not slugs:
-        raise ValueError("'task_slugs' must be a non-empty list of L5 task slugs.")
+        raise ValueError("'task_slugs' must be a non-empty list of L5 task slugs (used as the train/ID set).")
     cfg["task_slugs"] = [_validate_l5_slug(s) for s in slugs]
+
+    train_slugs = cfg.get("train_task_slugs")
+    if train_slugs is not None:
+        if not isinstance(train_slugs, list) or not train_slugs:
+            raise ValueError("'train_task_slugs' must be a non-empty list when provided.")
+        cfg["train_task_slugs"] = [_validate_l5_slug(s) for s in train_slugs]
+
+    eval_all = cfg.get("eval_all_tasks", False)
+    if not isinstance(eval_all, bool):
+        raise ValueError("'eval_all_tasks' must be a boolean when provided.")
     return cfg
 
 
@@ -692,11 +723,23 @@ def main():
     _set_global_seed(seed_plan.global_seed, deterministic=True)
 
     policy = build_policy(checkpoint=Path(checkpoint), device=device)
-    slugs = [str(s) for s in config["task_slugs"]]
-    episode_tasks = [slug for slug in slugs for _ in range(int(n_trials_per_task))]
-    print(f"CG_L5 evaluation: {len(slugs)} tasks x {int(n_trials_per_task)} trials = {len(episode_tasks)} episodes.")
+    train_slugs = [str(s) for s in (config.get("train_task_slugs") or config["task_slugs"])]
+    train_set = set(train_slugs)
 
-    t_probe = _slug_to_task(slugs[0])
+    if bool(config.get("eval_all_tasks", False)):
+        eval_slugs = _build_all_task_slugs()
+        eval_mode = "all_64"
+    else:
+        eval_slugs = [str(s) for s in config["task_slugs"]]
+        eval_mode = "config"
+
+    episode_tasks = [slug for slug in eval_slugs for _ in range(int(n_trials_per_task))]
+    print(
+        f"CG_L5 evaluation ({eval_mode}): {len(eval_slugs)} tasks x {int(n_trials_per_task)} trials "
+        f"= {len(episode_tasks)} episodes."
+    )
+
+    t_probe = _slug_to_task(eval_slugs[0])
     env = L5ImageEvalWrapper(
         make_env_fn=lambda: make_env(t_probe, horizon=horizon),
         num_envs=int(num_envs),
@@ -705,7 +748,7 @@ def main():
     fps = int(getattr(env.envs[0], "control_freq", 20))
     print(f"env control_freq={fps} Hz | num_envs={num_envs}")
 
-    probe_tasks = [_slug_to_task(slugs[0]) for _ in range(int(num_envs))]
+    probe_tasks = [_slug_to_task(eval_slugs[0]) for _ in range(int(num_envs))]
     probe_reset_seeds = [int(seed_plan.global_seed + i) for i in range(int(num_envs))]
     obs, _ = env.reset(tasks=probe_tasks, reset_seeds=probe_reset_seeds)
     policy_state_dim = int(np.prod(policy.state_feature.shape))
@@ -736,7 +779,9 @@ def main():
         "n_execute": int(n_execute),
         "max_videos": int(max_videos),
         "seed": int(seed),
-        "eval_task_slugs": slugs,
+        "eval_task_slugs": eval_slugs,
+        "eval_mode": eval_mode,
+        "train_task_slugs": train_slugs,
         "result_config": result_config,
         "reproducibility": {"deterministic_torch": True, "seed_plan": asdict(seed_plan)},
     }
@@ -754,6 +799,7 @@ def main():
         max_videos=int(max_videos),
         result_config=result_config,
         seed_plan=seed_plan,
+        train_task_slugs=train_set,
     )
     env.close()
 
@@ -762,6 +808,10 @@ def main():
     print(f"EVAL SUMMARY ({agg['n_episodes']} episodes, {agg['eval_s']:.1f}s)")
     print("=" * 60)
     print(f"  Success rate : {agg['pc_success']:.1f}%")
+    if "pc_success_in_dist" in agg:
+        print(f"  ID success   : {agg['pc_success_in_dist']:.1f}%  ({agg.get('n_episodes_in_dist', 0)} episodes)")
+    if "pc_success_ood" in agg:
+        print(f"  OOD success  : {agg['pc_success_ood']:.1f}%  ({agg.get('n_episodes_ood', 0)} episodes)")
     print(f"  Avg sum rew  : {agg['avg_sum_reward']:.3f}")
     print(f"  Avg max rew  : {agg['avg_max_reward']:.3f}")
     print(f"  Avg length   : {agg['avg_ep_length']:.1f} +/- {agg['std_ep_length']:.1f} steps")
