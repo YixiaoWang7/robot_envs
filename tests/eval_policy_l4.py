@@ -500,6 +500,34 @@ def _parse_task_indices(task: str | None) -> tuple[int, int]:
     return parse_task_indices(task, level="l4")
 
 
+def _check_success_any_container(env_i) -> str | None:
+    """Try ``_check_success()`` for every L4 container, return name on first hit."""
+    original_index = int(getattr(env_i, "object_B_index", 0))
+    try:
+        for ci, cont_name in enumerate(_L4_CONTAINERS):
+            env_i.object_B_index = ci
+            if hasattr(env_i, "_refresh_task_pointers") and callable(env_i._refresh_task_pointers):
+                env_i._refresh_task_pointers()
+            try:
+                if bool(env_i._check_success()):
+                    return cont_name
+            except Exception:
+                continue
+    finally:
+        env_i.object_B_index = original_index
+        if hasattr(env_i, "_refresh_task_pointers") and callable(env_i._refresh_task_pointers):
+            env_i._refresh_task_pointers()
+    return None
+
+
+def _detect_object_only(policy) -> bool:
+    """Return True when the loaded policy uses a single (object-only) query token."""
+    model = getattr(policy, "model", None)
+    if model is not None and hasattr(model, "num_query_tokens"):
+        return int(model.num_query_tokens) == 1
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Image preprocessing (matches training pipeline)
 # ---------------------------------------------------------------------------
@@ -698,9 +726,18 @@ def run_batch(
             cross_close[i] = c
 
     task_idx_tensors = []
-    for i in range(num_envs):
-        obj_i, cont_i = _parse_task_indices(tasks[i])
-        task_idx_tensors.append(torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device))
+    object_only = _detect_object_only(policy)
+    if object_only:
+        for i in range(num_envs):
+            obj_i, _cont_i = _parse_task_indices(tasks[i])
+            task_idx_tensors.append(torch.tensor([[obj_i]], dtype=torch.long, device=device))
+    else:
+        for i in range(num_envs):
+            obj_i, cont_i = _parse_task_indices(tasks[i])
+            task_idx_tensors.append(torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device))
+
+    ep_placed_container: list[str | None] = [None] * num_envs
+    ep_pick_success: list[bool] = [False] * num_envs
 
     state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
     env_state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)] if use_env_state else []
@@ -840,8 +877,37 @@ def run_batch(
             lengths[i] += 1
             ep_actions[i].append(action_mat[i].copy())
             ep_rewards[i].append(r)
-            if bool(successes[i]):
-                ep_success[i] = True
+
+            if object_only:
+                if not ep_pick_success[i]:
+                    obj_idx = int(task_idx_tensors[i][0, 0].item())
+                    try:
+                        is_grasping = bool(env.envs[i]._check_grasp(
+                            gripper=env.envs[i].robots[0].gripper,
+                            object_geoms=env.envs[i].object_A_list[obj_idx],
+                        ))
+                        if is_grasping:
+                            ep_pick_success[i] = True
+                    except Exception:
+                        pass
+                if not ep_success[i]:
+                    original_a_idx = int(getattr(env.envs[i], "object_A_index", 0))
+                    obj_idx = int(task_idx_tensors[i][0, 0].item())
+                    try:
+                        env.envs[i].object_A_index = obj_idx
+                        if hasattr(env.envs[i], "_refresh_task_pointers"):
+                            env.envs[i]._refresh_task_pointers()
+                        placed = _check_success_any_container(env.envs[i])
+                        if placed is not None:
+                            ep_success[i] = True
+                            ep_placed_container[i] = placed
+                    finally:
+                        env.envs[i].object_A_index = original_a_idx
+                        if hasattr(env.envs[i], "_refresh_task_pointers"):
+                            env.envs[i]._refresh_task_pointers()
+            else:
+                if bool(successes[i]):
+                    ep_success[i] = True
 
             step_done = bool(terminated[i] if hasattr(terminated, "__len__") else terminated) or bool(
                 truncated[i] if hasattr(truncated, "__len__") else truncated
@@ -884,6 +950,8 @@ def run_batch(
         "task": tasks,
         "actions": [np.stack(a, axis=0) if a else np.zeros((0, 7), dtype=np.float32) for a in ep_actions],
         "rewards": [np.array(r, dtype=np.float32) for r in ep_rewards],
+        "placed_container": ep_placed_container,
+        "pick_success": ep_pick_success,
     }
 
 
@@ -1040,12 +1108,15 @@ def eval_policy(
                     rewards=batch["rewards"][i],
                     success=np.array([batch["success"][i]]),
                     task=np.array([batch["task"][i]]),
+                    placed_container=np.array([batch["placed_container"][i] or ""]),
                 )
 
             all_episodes.append({
                 "episode_ix":  ep_ix,
                 "task":        batch["task"][i],
                 "success":     bool(batch["success"][i]),
+                "placed_container": batch["placed_container"][i],
+                "pick_success": bool(batch["pick_success"][i]),
                 "sum_reward":  float(batch["sum_reward"][i]),
                 "max_reward":  float(batch["max_reward"][i]),
                 "length":      int(batch["length"][i]),
@@ -1073,15 +1144,20 @@ def eval_policy(
     # ------------------------------------------------------------------
     # Per-task breakdown
     # ------------------------------------------------------------------
+    object_only = _detect_object_only(policy)
     per_task: dict[str, dict] = {}
     task_successes: dict[str, list[bool]] = defaultdict(list)
     task_rewards: dict[str, list[float]] = defaultdict(list)
     task_lengths: dict[str, list[int]] = defaultdict(list)
+    task_pick_successes: dict[str, list[bool]] = defaultdict(list)
+    task_placed_containers: dict[str, list[str | None]] = defaultdict(list)
     
     for ep in all_episodes:
         task_successes[ep["task"]].append(ep["success"])
         task_rewards[ep["task"]].append(ep["sum_reward"])
         task_lengths[ep["task"]].append(ep["length"])
+        task_pick_successes[ep["task"]].append(ep.get("pick_success", False))
+        task_placed_containers[ep["task"]].append(ep.get("placed_container"))
     
     for task, succs in task_successes.items():
         per_task_stats = {
@@ -1105,6 +1181,16 @@ def eval_policy(
                 "min_length": int(np.min(task_lengths[task])),
                 "max_length": int(np.max(task_lengths[task])),
             })
+
+        if object_only:
+            picks = task_pick_successes[task]
+            per_task_stats["n_pick_success"] = int(sum(picks))
+            per_task_stats["pc_pick_success"] = float(np.mean(picks) * 100)
+            containers = task_placed_containers[task]
+            for cont_name in _L4_CONTAINERS:
+                n = sum(1 for c in containers if c == cont_name)
+                per_task_stats[f"n_place_to_{cont_name}"] = n
+                per_task_stats[f"pc_place_to_{cont_name}"] = float(n / max(len(containers), 1) * 100)
         
         per_task[task] = per_task_stats
 
@@ -1118,6 +1204,18 @@ def eval_policy(
         "eval_s":        elapsed,
         "eval_ep_s":     elapsed / max(len(all_episodes), 1),
     }
+
+    if object_only:
+        n_total = max(len(all_episodes), 1)
+        all_picks = [e.get("pick_success", False) for e in all_episodes]
+        aggregated["n_pick_success"] = int(sum(all_picks))
+        aggregated["pc_pick_success"] = float(np.mean(all_picks) * 100)
+        all_containers = [e.get("placed_container") for e in all_episodes]
+        for cont_name in _L4_CONTAINERS:
+            n = sum(1 for c in all_containers if c == cont_name)
+            aggregated[f"n_place_to_{cont_name}"] = n
+            aggregated[f"pc_place_to_{cont_name}"] = float(n / n_total * 100)
+        aggregated["object_only"] = True
 
     info = {
         "aggregated":  aggregated,
@@ -1237,6 +1335,9 @@ def main():
         device=device,
     )
 
+    if _detect_object_only(policy):
+        print("Object-only query mode detected (num_query_tokens=1)")
+
     wrapper_cls = ImageBasedCGWrapper if policy.image_feature is not None else StateBasedCGWrapper
     env = wrapper_cls(
         make_env_fn=lambda: make_env("all", horizon=horizon),
@@ -1331,6 +1432,11 @@ def main():
     print(f"EVAL SUMMARY  ({agg['n_episodes']} episodes, {agg['eval_s']:.1f}s)")
     print("=" * 60)
     print(f"  Success rate : {agg['pc_success']:.1f}%")
+    if agg.get("object_only"):
+        print(f"  Pick success : {agg['pc_pick_success']:.1f}%")
+        for cont_name in _L4_CONTAINERS:
+            k = f"pc_place_to_{cont_name}"
+            print(f"  Place→{cont_name:<14s}: {agg[k]:.1f}%  (n={agg[f'n_place_to_{cont_name}']})")
     print(f"  Avg sum rew  : {agg['avg_sum_reward']:.3f}")
     print(f"  Avg max rew  : {agg['avg_max_reward']:.3f}")
     print(f"  Avg length   : {agg['avg_ep_length']:.1f} ± {agg['std_ep_length']:.1f} steps")
@@ -1343,6 +1449,12 @@ def main():
                 print(f"    {'':40s}  avg_rew={stats['avg_sum_reward']:.3f} ± {stats['std_sum_reward']:.3f}")
             if result_config.get("include_action_statistics", True):
                 print(f"    {'':40s}  avg_len={stats['avg_length']:.1f} ± {stats['std_length']:.1f}")
+            if agg.get("object_only"):
+                containers_str = "  ".join(
+                    f"{c}={stats.get(f'pc_place_to_{c}', 0):.0f}%"
+                    for c in _L4_CONTAINERS
+                )
+                print(f"    {'':40s}  pick={stats.get('pc_pick_success', 0):.0f}%  {containers_str}")
 
         # Save 4×4 success-rate grid image (train vs eval bordered).
         try:

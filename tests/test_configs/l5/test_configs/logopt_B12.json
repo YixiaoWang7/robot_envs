@@ -1,0 +1,48 @@
+{
+  "eval_config": {
+    "checkpoint": "",
+    "device": "cuda",
+    "num_envs": 8,
+    "horizon": 500,
+    "n_execute": 8,
+    "out_dir": "artifacts/eval_l5",
+    "max_videos": 10,
+    "n_trials_per_task": 10,
+    "seed": 0
+  },
+  "result_config": {
+    "save_per_episode_details": true,
+    "save_per_task_breakdown": true,
+    "include_reward_statistics": true,
+    "include_action_statistics": true
+  },
+  "eval_all_tasks": true,
+  "train_task_slugs": [
+    "cross_into_bin_press_green",
+    "cross_into_mug_press_red",
+    "cross_into_mug_no_handle_press_blue",
+    "cube_into_mug_press_blue",
+    "cube_into_plate_press_yellow",
+    "cube_into_mug_no_handle_press_red",
+    "cylinder_into_bin_press_blue",
+    "cylinder_into_mug_press_yellow",
+    "cylinder_into_plate_press_green",
+    "milk_into_bin_press_yellow",
+    "milk_into_plate_press_red",
+    "milk_into_mug_no_handle_press_green"
+  ],
+  "task_slugs": [
+    "cross_into_bin_press_green",
+    "cross_into_mug_press_red",
+    "cross_into_mug_no_handle_press_blue",
+    "cube_into_mug_press_blue",
+    "cube_into_plate_press_yellow",
+    "cube_into_mug_no_handle_press_red",
+    "cylinder_into_bin_press_blue",
+    "cylinder_into_mug_press_yellow",
+    "cylinder_into_plate_press_green",
+    "milk_into_bin_press_yellow",
+    "milk_into_plate_press_red",
+    "milk_into_mug_no_handle_press_green"
+  ]
+}
