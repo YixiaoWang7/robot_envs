@@ -973,6 +973,7 @@ def eval_policy(
     max_cross_attn_videos: int,
     result_config: dict,
     seed_plan: EvalSeedPlan,
+    train_tasks: set[str] | None = None,
 ) -> dict:
     """
     Run ceil(n_episodes / num_envs) batched rollouts and aggregate metrics.
@@ -1205,6 +1206,16 @@ def eval_policy(
         "eval_ep_s":     elapsed / max(len(all_episodes), 1),
     }
 
+    if train_tasks:
+        id_succs = [bool(e["success"]) for e in all_episodes if e["task"] in train_tasks]
+        ood_succs = [bool(e["success"]) for e in all_episodes if e["task"] not in train_tasks]
+        if id_succs:
+            aggregated["pc_success_in_dist"] = float(np.mean(id_succs) * 100)
+            aggregated["n_episodes_in_dist"] = len(id_succs)
+        if ood_succs:
+            aggregated["pc_success_ood"] = float(np.mean(ood_succs) * 100)
+            aggregated["n_episodes_ood"] = len(ood_succs)
+
     if object_only:
         n_total = max(len(all_episodes), 1)
         all_picks = [e.get("pick_success", False) for e in all_episodes]
@@ -1422,6 +1433,7 @@ def main():
         max_cross_attn_videos=int(max_cross_attn_videos),
         result_config=result_config,
         seed_plan=seed_plan,
+        train_tasks=train_tasks if train_tasks else None,
     )
 
     env.close()
@@ -1432,6 +1444,10 @@ def main():
     print(f"EVAL SUMMARY  ({agg['n_episodes']} episodes, {agg['eval_s']:.1f}s)")
     print("=" * 60)
     print(f"  Success rate : {agg['pc_success']:.1f}%")
+    if "pc_success_in_dist" in agg:
+        print(f"  ID success   : {agg['pc_success_in_dist']:.1f}%  ({agg.get('n_episodes_in_dist', 0)} episodes)")
+    if "pc_success_ood" in agg:
+        print(f"  OOD success  : {agg['pc_success_ood']:.1f}%  ({agg.get('n_episodes_ood', 0)} episodes)")
     if agg.get("object_only"):
         print(f"  Pick success : {agg['pc_pick_success']:.1f}%")
         for cont_name in _L4_CONTAINERS:
