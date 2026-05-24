@@ -365,18 +365,18 @@ def make_env(task: str, *, horizon: int):
     bootstrap_sampler_a = UniformApartRandomSampler(
         name="FullDesk_Object_A_Sampler",
         x_range=[-0.18, 0.20],
-        y_range=[-0.28, -0.05],
+        y_range=[-0.20, -0.05],
         rotation=None,
         ensure_object_boundary_in_range=False,
         ensure_valid_placement=True,
         reference_pos=(0.0, 0.0, 0.8),
         z_offset=0.01,
-        min_distance=0.01,
+        min_distance=0.02,
     )
     bootstrap_sampler_b = UniformApartRandomSampler(
         name="FullDesk_Object_B_Sampler",
         x_range=[-0.18, 0.20],
-        y_range=[0.05, 0.28],
+        y_range=[0.05, 0.20],
         rotation=None,
         ensure_object_boundary_in_range=False,
         ensure_valid_placement=True,
