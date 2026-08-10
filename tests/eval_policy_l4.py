@@ -520,12 +520,75 @@ def _check_success_any_container(env_i) -> str | None:
     return None
 
 
-def _detect_object_only(policy) -> bool:
-    """Return True when the loaded policy uses a single (object-only) query token."""
+def _get_query_factor_names(policy) -> list[str]:
+    """Return the list of query factor names from the policy's processor config."""
+    proc = getattr(policy, "processor", None)
+    cfg = getattr(proc, "_config", None) if proc is not None else None
+    factors = getattr(cfg, "query_factors", None)
+    if factors:
+        return [f.name for f in factors]
     model = getattr(policy, "model", None)
-    if model is not None and hasattr(model, "num_query_tokens"):
-        return int(model.num_query_tokens) == 1
-    return False
+    nq = int(getattr(model, "num_query_tokens", 2)) if model is not None else 2
+    if nq == 1:
+        return ["object"]
+    return ["object", "container"]
+
+
+def _has_factor(policy, vocab_name: str) -> bool:
+    """Check if any query factor uses the given vocab."""
+    proc = getattr(policy, "processor", None)
+    cfg = getattr(proc, "_config", None) if proc is not None else None
+    factors = getattr(cfg, "query_factors", None)
+    if factors:
+        return any(f.vocab == vocab_name for f in factors)
+    return vocab_name in ("object", "container")
+
+
+def _detect_query_mode(policy) -> str:
+    """Detect the query mode from the policy's query_factors config.
+
+    Returns ``"object_only"``, ``"container_only"``, or ``"standard"``.
+    """
+    has_obj = _has_factor(policy, "object")
+    has_cont = _has_factor(policy, "container")
+    if has_obj and not has_cont:
+        return "object_only"
+    if has_cont and not has_obj:
+        return "container_only"
+    return "standard"
+
+
+def _detect_object_only(policy) -> bool:
+    return _detect_query_mode(policy) == "object_only"
+
+
+def _detect_container_only(policy) -> bool:
+    return _detect_query_mode(policy) == "container_only"
+
+
+def _check_success_any_object(env_i, cont_idx: int) -> str | None:
+    """Try ``_check_success()`` for every L4 object with the given container; return object name on first hit."""
+    original_a_idx = int(getattr(env_i, "object_A_index", 0))
+    original_b_idx = int(getattr(env_i, "object_B_index", 0))
+    try:
+        env_i.object_B_index = cont_idx
+        if hasattr(env_i, "_refresh_task_pointers") and callable(env_i._refresh_task_pointers):
+            env_i._refresh_task_pointers()
+        for oi, obj_name in enumerate(_L4_OBJECTS):
+            env_i.object_A_index = oi
+            if hasattr(env_i, "_refresh_task_pointers") and callable(env_i._refresh_task_pointers):
+                env_i._refresh_task_pointers()
+            try:
+                if bool(env_i._check_success()):
+                    return obj_name
+            except Exception:
+                continue
+    finally:
+        env_i.object_A_index = original_a_idx
+        env_i.object_B_index = original_b_idx
+        if hasattr(env_i, "_refresh_task_pointers") and callable(env_i._refresh_task_pointers):
+            env_i._refresh_task_pointers()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -725,18 +788,23 @@ def run_batch(
             cross_append[i] = a
             cross_close[i] = c
 
-    task_idx_tensors = []
-    object_only = _detect_object_only(policy)
-    if object_only:
-        for i in range(num_envs):
-            obj_i, _cont_i = _parse_task_indices(tasks[i])
-            task_idx_tensors.append(torch.tensor([[obj_i]], dtype=torch.long, device=device))
+    query_mode = _detect_query_mode(policy)
+    object_only = query_mode == "object_only"
+    container_only = query_mode == "container_only"
+
+    proc_cfg = getattr(getattr(policy, "processor", None), "_config", None)
+    proc_factors = getattr(proc_cfg, "query_factors", None)
+    if proc_factors:
+        task_idx_full = policy.processor.infer_task_indices_generic(tasks).to(device=device)
+        task_idx_tensors = [task_idx_full[i : i + 1] for i in range(num_envs)]
     else:
+        task_idx_tensors = []
         for i in range(num_envs):
             obj_i, cont_i = _parse_task_indices(tasks[i])
             task_idx_tensors.append(torch.tensor([[obj_i, cont_i]], dtype=torch.long, device=device))
 
     ep_placed_container: list[str | None] = [None] * num_envs
+    ep_placed_object: list[str | None] = [None] * num_envs
     ep_pick_success: list[bool] = [False] * num_envs
 
     state_hists = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
@@ -905,6 +973,26 @@ def run_batch(
                         env.envs[i].object_A_index = original_a_idx
                         if hasattr(env.envs[i], "_refresh_task_pointers"):
                             env.envs[i]._refresh_task_pointers()
+            elif container_only:
+                if not ep_pick_success[i]:
+                    try:
+                        for oi in range(len(_L4_OBJECTS)):
+                            is_grasping = bool(env.envs[i]._check_grasp(
+                                gripper=env.envs[i].robots[0].gripper,
+                                object_geoms=env.envs[i].object_A_list[oi],
+                            ))
+                            if is_grasping:
+                                ep_pick_success[i] = True
+                                break
+                    except Exception:
+                        pass
+                if not ep_success[i]:
+                    cont_idx = int(task_idx_tensors[i][0, 0].item())
+                    placed_obj = _check_success_any_object(env.envs[i], cont_idx)
+                    if placed_obj is not None:
+                        ep_success[i] = True
+                        ep_placed_object[i] = placed_obj
+                        ep_placed_container[i] = _L4_CONTAINERS[cont_idx]
             else:
                 if bool(successes[i]):
                     ep_success[i] = True
@@ -951,6 +1039,7 @@ def run_batch(
         "actions": [np.stack(a, axis=0) if a else np.zeros((0, 7), dtype=np.float32) for a in ep_actions],
         "rewards": [np.array(r, dtype=np.float32) for r in ep_rewards],
         "placed_container": ep_placed_container,
+        "placed_object": ep_placed_object,
         "pick_success": ep_pick_success,
     }
 
@@ -1117,6 +1206,7 @@ def eval_policy(
                 "task":        batch["task"][i],
                 "success":     bool(batch["success"][i]),
                 "placed_container": batch["placed_container"][i],
+                "placed_object": batch["placed_object"][i],
                 "pick_success": bool(batch["pick_success"][i]),
                 "sum_reward":  float(batch["sum_reward"][i]),
                 "max_reward":  float(batch["max_reward"][i]),
@@ -1145,13 +1235,16 @@ def eval_policy(
     # ------------------------------------------------------------------
     # Per-task breakdown
     # ------------------------------------------------------------------
-    object_only = _detect_object_only(policy)
+    query_mode = _detect_query_mode(policy)
+    object_only = query_mode == "object_only"
+    container_only = query_mode == "container_only"
     per_task: dict[str, dict] = {}
     task_successes: dict[str, list[bool]] = defaultdict(list)
     task_rewards: dict[str, list[float]] = defaultdict(list)
     task_lengths: dict[str, list[int]] = defaultdict(list)
     task_pick_successes: dict[str, list[bool]] = defaultdict(list)
     task_placed_containers: dict[str, list[str | None]] = defaultdict(list)
+    task_placed_objects: dict[str, list[str | None]] = defaultdict(list)
     
     for ep in all_episodes:
         task_successes[ep["task"]].append(ep["success"])
@@ -1159,6 +1252,7 @@ def eval_policy(
         task_lengths[ep["task"]].append(ep["length"])
         task_pick_successes[ep["task"]].append(ep.get("pick_success", False))
         task_placed_containers[ep["task"]].append(ep.get("placed_container"))
+        task_placed_objects[ep["task"]].append(ep.get("placed_object"))
     
     for task, succs in task_successes.items():
         per_task_stats = {
@@ -1192,6 +1286,16 @@ def eval_policy(
                 n = sum(1 for c in containers if c == cont_name)
                 per_task_stats[f"n_place_to_{cont_name}"] = n
                 per_task_stats[f"pc_place_to_{cont_name}"] = float(n / max(len(containers), 1) * 100)
+
+        if container_only:
+            picks = task_pick_successes[task]
+            per_task_stats["n_pick_success"] = int(sum(picks))
+            per_task_stats["pc_pick_success"] = float(np.mean(picks) * 100)
+            objects = task_placed_objects[task]
+            for obj_name in _L4_OBJECTS:
+                n = sum(1 for o in objects if o == obj_name)
+                per_task_stats[f"n_place_by_{obj_name}"] = n
+                per_task_stats[f"pc_place_by_{obj_name}"] = float(n / max(len(objects), 1) * 100)
         
         per_task[task] = per_task_stats
 
@@ -1227,6 +1331,18 @@ def eval_policy(
             aggregated[f"n_place_to_{cont_name}"] = n
             aggregated[f"pc_place_to_{cont_name}"] = float(n / n_total * 100)
         aggregated["object_only"] = True
+
+    if container_only:
+        n_total = max(len(all_episodes), 1)
+        all_picks = [e.get("pick_success", False) for e in all_episodes]
+        aggregated["n_pick_success"] = int(sum(all_picks))
+        aggregated["pc_pick_success"] = float(np.mean(all_picks) * 100)
+        all_objects = [e.get("placed_object") for e in all_episodes]
+        for obj_name in _L4_OBJECTS:
+            n = sum(1 for o in all_objects if o == obj_name)
+            aggregated[f"n_place_by_{obj_name}"] = n
+            aggregated[f"pc_place_by_{obj_name}"] = float(n / n_total * 100)
+        aggregated["container_only"] = True
 
     info = {
         "aggregated":  aggregated,
@@ -1346,8 +1462,11 @@ def main():
         device=device,
     )
 
-    if _detect_object_only(policy):
+    qm = _detect_query_mode(policy)
+    if qm == "object_only":
         print("Object-only query mode detected (num_query_tokens=1)")
+    elif qm == "container_only":
+        print("Container-only query mode detected (num_query_tokens=1)")
 
     wrapper_cls = ImageBasedCGWrapper if policy.image_feature is not None else StateBasedCGWrapper
     env = wrapper_cls(
@@ -1453,6 +1572,11 @@ def main():
         for cont_name in _L4_CONTAINERS:
             k = f"pc_place_to_{cont_name}"
             print(f"  Place→{cont_name:<14s}: {agg[k]:.1f}%  (n={agg[f'n_place_to_{cont_name}']})")
+    if agg.get("container_only"):
+        print(f"  Pick success : {agg['pc_pick_success']:.1f}%")
+        for obj_name in _L4_OBJECTS:
+            k = f"pc_place_by_{obj_name}"
+            print(f"  PlaceBy {obj_name:<11s}: {agg[k]:.1f}%  (n={agg[f'n_place_by_{obj_name}']})")
     print(f"  Avg sum rew  : {agg['avg_sum_reward']:.3f}")
     print(f"  Avg max rew  : {agg['avg_max_reward']:.3f}")
     print(f"  Avg length   : {agg['avg_ep_length']:.1f} ± {agg['std_ep_length']:.1f} steps")
@@ -1471,6 +1595,12 @@ def main():
                     for c in _L4_CONTAINERS
                 )
                 print(f"    {'':40s}  pick={stats.get('pc_pick_success', 0):.0f}%  {containers_str}")
+            if agg.get("container_only"):
+                objects_str = "  ".join(
+                    f"{o}={stats.get(f'pc_place_by_{o}', 0):.0f}%"
+                    for o in _L4_OBJECTS
+                )
+                print(f"    {'':40s}  pick={stats.get('pc_pick_success', 0):.0f}%  {objects_str}")
 
         # Save 4×4 success-rate grid image (train vs eval bordered).
         try:
